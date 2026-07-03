@@ -2,6 +2,7 @@ mod data_reader;
 mod native_file;
 mod native_file_parse;
 mod text_parsing;
+mod utility;
 
 pub use native_file::{
     BoundingBox, BoxInfo, CellHeader, ComponentBounds, CoordinateSystem, Header, IndexDomain,
