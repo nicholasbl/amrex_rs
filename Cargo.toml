@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-glam = "0.33.2"
+glam = "0.33"
+memmap2 = "0.9"
