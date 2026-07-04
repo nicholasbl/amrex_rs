@@ -2,7 +2,9 @@ mod data_reader;
 mod native_file;
 mod native_file_parse;
 mod text_parsing;
-mod utility;
+pub mod utility;
+
+pub use utility::isosurface::{IsosurfaceOptions, Mesh3D, Sample, Surface, Vertex3D, isosurface};
 
 pub use native_file::{
     BoundingBox, BoxInfo, CellHeader, ComponentBounds, CoordinateSystem, Header, IndexDomain,

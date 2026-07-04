@@ -1,3 +1,3 @@
 mod compress;
-mod isosurface;
+pub mod isosurface;
 mod sparse_grid3;
