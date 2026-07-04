@@ -1,10 +1,14 @@
 mod data_reader;
+pub mod isosurface;
 mod native_file;
 mod native_file_parse;
+pub(crate) mod sparse_amr;
 mod text_parsing;
 pub mod utility;
 
-pub use utility::isosurface::{IsosurfaceOptions, Mesh3D, Sample, Surface, Vertex3D, isosurface};
+pub use isosurface::{
+    IsosurfaceMethod, IsosurfaceOptions, Mesh3D, Sample, Surface, Vertex3D, isosurface,
+};
 
 pub use native_file::{
     BoundingBox, BoxInfo, CellHeader, ComponentBounds, CoordinateSystem, Header, IndexDomain,
