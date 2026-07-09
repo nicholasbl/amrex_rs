@@ -38,7 +38,7 @@ enum VertexKey {
 }
 
 struct RmtMesher<'a> {
-    level: &'a DualGridLevel,
+    level: &'a DualGridLevel<'a>,
     ranges: &'a [SampleRange],
     isovalue: f32,
     regularization: f32,
@@ -205,7 +205,7 @@ fn grid_point_le(a: UVec3, b: UVec3) -> bool {
 }
 
 pub(super) fn mesh_level(
-    level: &DualGridLevel,
+    level: &DualGridLevel<'_>,
     ranges: &[SampleRange],
     isovalue: f32,
     regularization: f32,

@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 
 use glam::prelude::*;
 
-use crate::{native_file_parse::*, text_parsing::*};
+use super::{data_reader::DataReader, native_file_parse::*, text_parsing::*};
 
 #[derive(Debug)]
 pub struct BoundingBox {
@@ -113,8 +113,8 @@ impl PlotFile {
         }
     }
 
-    pub fn data_reader(&self) -> crate::DataReader<'_> {
-        crate::DataReader::new(self)
+    pub fn data_reader(&self) -> DataReader<'_> {
+        DataReader::new(self)
     }
 
     /// Load and cross-check every per-level `Cell_H` file.

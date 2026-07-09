@@ -18,6 +18,22 @@ pub enum GridError {
     ValuesLengthMismatch { expected: usize, actual: usize },
 }
 
+pub(crate) enum SparseGridChunkView<'a, T>
+where
+    T: Copy + PartialEq,
+{
+    Uniform {
+        key: UVec3,
+        value: T,
+        mask: [u64; super::MASK_WORDS],
+    },
+    Dense {
+        key: UVec3,
+        values: &'a [T],
+        mask: [u64; super::MASK_WORDS],
+    },
+}
+
 /// Bounded, chunked, sparse 3D grid.
 ///
 /// `T` is intentionally constrained to `Copy + PartialEq` to keep chunk promotion,
@@ -74,6 +90,27 @@ where
     #[inline]
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    pub(crate) fn for_each_chunk<F>(&self, mut f: F)
+    where
+        F: FnMut(SparseGridChunkView<'_, T>),
+    {
+        for (&key, chunk) in &self.chunks {
+            let key = UVec3::new(key.x, key.y, key.z);
+            match chunk {
+                Chunk::Uniform { value, mask } => f(SparseGridChunkView::Uniform {
+                    key,
+                    value: *value,
+                    mask: mask.words(),
+                }),
+                Chunk::Dense { values, mask } => f(SparseGridChunkView::Dense {
+                    key,
+                    values,
+                    mask: mask.words(),
+                }),
+            }
+        }
     }
 
     /// Counts present voxels by summing chunk masks.

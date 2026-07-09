@@ -87,7 +87,7 @@ impl Tiling {
 }
 
 struct Mc33Mesher<'a> {
-    level: &'a DualGridLevel,
+    level: &'a DualGridLevel<'a>,
     ranges: &'a [SampleRange],
     isovalue: f32,
     mesh: &'a mut Mesh3D,
@@ -233,7 +233,7 @@ impl Mc33Mesher<'_> {
 }
 
 pub(super) fn mesh_level(
-    level: &DualGridLevel,
+    level: &DualGridLevel<'_>,
     ranges: &[SampleRange],
     isovalue: f32,
     mesh: &mut Mesh3D,

@@ -9,7 +9,7 @@ use super::dual_grid::DualGridLevel;
 /// Interpolate auxiliary quantities along the same edge and with the same
 /// parameter used to place an isosurface vertex.
 pub(super) fn sampled_values_on_edge(
-    level: &DualGridLevel,
+    level: &DualGridLevel<'_>,
     start: UVec3,
     end: UVec3,
     t: f32,
@@ -28,7 +28,7 @@ pub(super) fn sampled_values_on_edge(
 
 /// Read auxiliary quantities at a lattice point used by an RMT-snapped vertex.
 pub(super) fn sampled_values_at(
-    level: &DualGridLevel,
+    level: &DualGridLevel<'_>,
     position: UVec3,
     ranges: &[SampleRange],
 ) -> Result<U16Vec2> {
@@ -40,7 +40,7 @@ pub(super) fn sampled_values_at(
 
 /// Blend auxiliary quantities using the weights of an MC33 interior vertex.
 pub(super) fn sampled_values_weighted(
-    level: &DualGridLevel,
+    level: &DualGridLevel<'_>,
     positions: &[UVec3; 8],
     weights: &[f64; 8],
     ranges: &[SampleRange],
@@ -60,7 +60,7 @@ pub(super) fn sampled_values_weighted(
 }
 
 fn encode_sampled_values<F>(
-    level: &DualGridLevel,
+    level: &DualGridLevel<'_>,
     ranges: &[SampleRange],
     mut value: F,
 ) -> Result<U16Vec2>

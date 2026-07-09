@@ -9,15 +9,18 @@ use crate::sparse_amr::level_translation;
 use crate::utility::{Aabb3u, SparseGrid3};
 use glam::{DVec3, I64Vec3, IVec3, U16Vec2, UVec3};
 
-fn level_with_sampled_quantities(sampled_quantities: Vec<SparseGrid3<f32>>) -> DualGridLevel {
+fn level_with_grids<'a>(
+    samples: &'a SparseGrid3<f32>,
+    sampled_quantities: Vec<&'a SparseGrid3<f32>>,
+    active_cubes: &'a SparseGrid3<()>,
+) -> DualGridLevel<'a> {
     DualGridLevel {
         level_index: 0,
-        index_origin: IVec3::ZERO,
         physical_origin: DVec3::ZERO,
         cell_size: DVec3::ONE,
-        samples: SparseGrid3::new(UVec3::new(2, 1, 1)),
+        samples,
         sampled_quantities,
-        active_cubes: SparseGrid3::new(UVec3::ZERO),
+        active_cubes,
     }
 }
 
@@ -89,7 +92,9 @@ fn edge_samples_are_interpolated_normalized_and_encoded_as_uv() {
     let mut v = SparseGrid3::new(UVec3::new(2, 1, 1));
     v.set(UVec3::ZERO, -5.0);
     v.set(UVec3::X, 15.0);
-    let level = level_with_sampled_quantities(vec![u, v]);
+    let samples = SparseGrid3::new(UVec3::new(2, 1, 1));
+    let active_cubes = SparseGrid3::new(UVec3::ZERO);
+    let level = level_with_grids(&samples, vec![&u, &v], &active_cubes);
     let ranges = [
         SampleRange {
             min: 0.0,
@@ -109,7 +114,9 @@ fn edge_samples_are_interpolated_normalized_and_encoded_as_uv() {
 fn snapped_samples_are_clamped_and_unused_axis_is_zero() {
     let mut u = SparseGrid3::new(UVec3::new(1, 1, 1));
     u.set(UVec3::ZERO, 12.0);
-    let level = level_with_sampled_quantities(vec![u]);
+    let samples = SparseGrid3::new(UVec3::new(1, 1, 1));
+    let active_cubes = SparseGrid3::new(UVec3::ZERO);
+    let level = level_with_grids(&samples, vec![&u], &active_cubes);
     let ranges = [SampleRange {
         min: 0.0,
         max: 10.0,
@@ -121,17 +128,17 @@ fn snapped_samples_are_clamped_and_unused_axis_is_zero() {
 
 #[test]
 fn rmt_extracts_a_plane() {
-    let mut level = level_with_sampled_quantities(Vec::new());
-    level.samples = SparseGrid3::new(UVec3::splat(2));
+    let mut samples = SparseGrid3::new(UVec3::splat(2));
     for z in 0..2 {
         for y in 0..2 {
             for x in 0..2 {
-                level.samples.set(UVec3::new(x, y, z), x as f32);
+                samples.set(UVec3::new(x, y, z), x as f32);
             }
         }
     }
-    level.active_cubes = SparseGrid3::new(UVec3::ONE);
-    level.active_cubes.set(UVec3::ZERO, ());
+    let mut active_cubes = SparseGrid3::new(UVec3::ONE);
+    active_cubes.set(UVec3::ZERO, ());
+    let level = level_with_grids(&samples, Vec::new(), &active_cubes);
 
     let mut mesh = Mesh3D {
         positions: Vec::new(),
@@ -155,17 +162,17 @@ fn rmt_extracts_a_plane() {
 
 #[test]
 fn mc33_extracts_a_plane_without_tetrahedral_diagonals() {
-    let mut level = level_with_sampled_quantities(Vec::new());
-    level.samples = SparseGrid3::new(UVec3::splat(2));
+    let mut samples = SparseGrid3::new(UVec3::splat(2));
     for z in 0..2 {
         for y in 0..2 {
             for x in 0..2 {
-                level.samples.set(UVec3::new(x, y, z), x as f32);
+                samples.set(UVec3::new(x, y, z), x as f32);
             }
         }
     }
-    level.active_cubes = SparseGrid3::new(UVec3::ONE);
-    level.active_cubes.set(UVec3::ZERO, ());
+    let mut active_cubes = SparseGrid3::new(UVec3::ONE);
+    active_cubes.set(UVec3::ZERO, ());
+    let level = level_with_grids(&samples, Vec::new(), &active_cubes);
 
     let mut mesh = Mesh3D {
         positions: Vec::new(),
@@ -201,6 +208,21 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
         )?;
         ensure!(!mesh.positions.is_empty(), "expected extracted vertices");
         ensure!(!mesh.faces.is_empty(), "expected extracted faces");
+
+        let compact = CompactPlot::load(&plotfile, &[0])?;
+        let mesh = isosurface_compact(
+            &compact,
+            IsosurfaceOptions {
+                surface: Surface { id: 0, value: 0.5 },
+                sampled_quantities: Vec::new(),
+                method: IsosurfaceMethod::Mc33,
+            },
+        )?;
+        ensure!(
+            !mesh.positions.is_empty(),
+            "expected compact extracted vertices"
+        );
+        ensure!(!mesh.faces.is_empty(), "expected compact extracted faces");
         Ok(())
     })();
 

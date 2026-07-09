@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use glam::IVec3;
 use memmap2::{Mmap, MmapOptions};
 
-use crate::{Level, Patch, Patches, PlotFile, Variable};
+use super::native_file::{Level, Patch, Patches, PlotFile, Variable};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarType {

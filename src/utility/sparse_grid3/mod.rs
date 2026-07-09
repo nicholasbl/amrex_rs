@@ -20,6 +20,7 @@ mod grid;
 mod layout;
 
 pub use aabb::Aabb3u;
+pub(crate) use grid::SparseGridChunkView;
 pub use grid::{GridAccessor, GridAccessorMut, GridError, SparseGrid3};
 
 /// log2 of the chunk edge length.
@@ -36,7 +37,7 @@ pub const CHUNK_VOLUME: usize =
     (CHUNK_SIZE as usize) * (CHUNK_SIZE as usize) * (CHUNK_SIZE as usize); // 32768
 
 pub(super) const MASK_WORD_BITS: usize = 64;
-pub(super) const MASK_WORDS: usize = CHUNK_VOLUME / MASK_WORD_BITS; // 512
+pub(crate) const MASK_WORDS: usize = CHUNK_VOLUME / MASK_WORD_BITS; // 512
 
 #[cfg(test)]
 mod tests;

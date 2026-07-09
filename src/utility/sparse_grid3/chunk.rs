@@ -353,6 +353,11 @@ pub(super) struct BitMask {
 
 impl BitMask {
     #[inline]
+    pub(super) fn words(&self) -> [u64; MASK_WORDS] {
+        self.words
+    }
+
+    #[inline]
     pub(super) fn empty() -> Self {
         Self {
             words: [0; MASK_WORDS],

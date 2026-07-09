@@ -9,8 +9,9 @@ use anyhow::{Context, Result, ensure};
 use glam::{U16Vec2, UVec3, Vec3};
 
 use crate::PlotFile;
+use crate::compact::CompactPlot;
 
-use dual_grid::load_dual_grid_levels;
+use dual_grid::{dual_grid_levels_from_compact, load_compact_for_isosurface};
 
 #[derive(Debug, Default)]
 pub struct Surface {
@@ -65,7 +66,10 @@ struct SampleSpec {
     range: SampleRange,
 }
 
-fn validate_sample_specs(plot_file: &PlotFile, samples: &[Sample]) -> Result<Vec<SampleSpec>> {
+fn validate_sample_specs_for_len(
+    variable_count: usize,
+    samples: &[Sample],
+) -> Result<Vec<SampleSpec>> {
     ensure!(
         samples.len() <= 2,
         "at most two sampled quantities are supported"
@@ -77,7 +81,7 @@ fn validate_sample_specs(plot_file: &PlotFile, samples: &[Sample]) -> Result<Vec
             let component =
                 usize::try_from(sample.id).context("sample component id is too large")?;
             ensure!(
-                component < plot_file.variables().len(),
+                component < variable_count,
                 "sample component index {component} is out of range"
             );
 
@@ -97,8 +101,15 @@ fn validate_sample_specs(plot_file: &PlotFile, samples: &[Sample]) -> Result<Vec
         .collect()
 }
 
-pub fn isosurface(plot_file: &PlotFile, options: IsosurfaceOptions) -> Result<Mesh3D> {
+fn validate_isosurface_options(
+    variable_count: usize,
+    options: &IsosurfaceOptions,
+) -> Result<(usize, f32, Vec<SampleSpec>)> {
     let component = usize::try_from(options.surface.id).context("surface id is too large")?;
+    ensure!(
+        component < variable_count,
+        "surface component index {component} is out of range"
+    );
     ensure!(options.surface.value.is_finite(), "isovalue must be finite");
     if let IsosurfaceMethod::Rmt { regularization } = options.method {
         ensure!(
@@ -109,12 +120,32 @@ pub fn isosurface(plot_file: &PlotFile, options: IsosurfaceOptions) -> Result<Me
     let isovalue = options.surface.value as f32;
     ensure!(isovalue.is_finite(), "isovalue does not fit in f32");
 
-    let sample_specs = validate_sample_specs(plot_file, &options.sampled_quantities)?;
+    let sample_specs = validate_sample_specs_for_len(variable_count, &options.sampled_quantities)?;
+    Ok((component, isovalue, sample_specs))
+}
+
+pub fn isosurface(plot_file: &PlotFile, options: IsosurfaceOptions) -> Result<Mesh3D> {
+    let (component, _, sample_specs) =
+        validate_isosurface_options(plot_file.variables().len(), &options)?;
     let sampled_components = sample_specs
         .iter()
         .map(|sample| sample.component)
         .collect::<Vec<_>>();
-    let levels = load_dual_grid_levels(plot_file, component, &sampled_components)?;
+    let compact_plot = load_compact_for_isosurface(plot_file, component, &sampled_components)?;
+    isosurface_compact(&compact_plot, options)
+}
+
+pub fn isosurface_compact(
+    compact_plot: &CompactPlot,
+    options: IsosurfaceOptions,
+) -> Result<Mesh3D> {
+    let (component, isovalue, sample_specs) =
+        validate_isosurface_options(compact_plot.variable_count(), &options)?;
+    let sampled_components = sample_specs
+        .iter()
+        .map(|sample| sample.component)
+        .collect::<Vec<_>>();
+    let levels = dual_grid_levels_from_compact(compact_plot, component, &sampled_components)?;
     let ranges = sample_specs
         .iter()
         .map(|sample| sample.range)

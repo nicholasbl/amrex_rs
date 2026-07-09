@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use glam::prelude::*;
 
-use crate::{native_file::*, text_parsing::*};
+use super::{native_file::*, text_parsing::*};
 
 pub fn read_header(path: impl AsRef<Path>) -> Result<Header> {
     let mut reader = Reader::new(path)?;
