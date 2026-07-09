@@ -358,6 +358,11 @@ impl BitMask {
     }
 
     #[inline]
+    pub(super) fn from_words(words: [u64; MASK_WORDS]) -> Self {
+        Self { words }
+    }
+
+    #[inline]
     pub(super) fn empty() -> Self {
         Self {
             words: [0; MASK_WORDS],

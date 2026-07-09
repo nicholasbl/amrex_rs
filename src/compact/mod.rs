@@ -6,7 +6,7 @@ use crate::{BoundingBox, CoordinateSystem, Header, IndexDomain, PlotFile, Variab
 
 use anyhow::{Context, Result, ensure};
 use glam::{DVec3, IVec3, UVec3};
-use rkyv::{Archive, Serialize, rancor::Error};
+use rkyv::{Archive, Deserialize, Serialize, rancor::Error};
 
 const FORMAT_MAGIC: [u8; 8] = *b"AMRCMPCT";
 const FORMAT_VERSION: u32 = 1;
@@ -28,7 +28,13 @@ pub fn write_compact(
     dest.write_all(&bytes).context("writing compact plot")
 }
 
-#[derive(Archive, Serialize)]
+pub fn read_compact(bytes: &[u8]) -> Result<CompactPlot> {
+    let archive =
+        rkyv::from_bytes::<CompactArchive, Error>(bytes).context("reading compact archive")?;
+    archive.into_compact_plot()
+}
+
+#[derive(Archive, Deserialize, Serialize)]
 struct CompactArchive {
     magic: [u8; 8],
     version: u32,
@@ -38,7 +44,7 @@ struct CompactArchive {
     levels: Vec<ArchiveLevel>,
 }
 
-#[derive(Archive, Serialize)]
+#[derive(Archive, Deserialize, Serialize)]
 struct ArchiveHeader {
     simulation_time: f64,
     finest_level: u64,
@@ -52,26 +58,26 @@ struct ArchiveHeader {
     boundary_width: u64,
 }
 
-#[derive(Archive, Serialize)]
+#[derive(Archive, Deserialize, Serialize)]
 struct ArchiveVariable {
     name: String,
     index: u64,
 }
 
-#[derive(Archive, Serialize)]
+#[derive(Archive, Deserialize, Serialize)]
 struct ArchiveBoundingBox {
     min: [f64; 3],
     max: [f64; 3],
 }
 
-#[derive(Archive, Serialize)]
+#[derive(Archive, Deserialize, Serialize)]
 struct ArchiveIndexDomain {
     min: [i32; 3],
     max: [i32; 3],
     index_type: [i32; 3],
 }
 
-#[derive(Archive, Serialize)]
+#[derive(Archive, Deserialize, Serialize)]
 struct ArchiveLevel {
     level_index: u64,
     index_origin: [i32; 3],
@@ -81,13 +87,13 @@ struct ArchiveLevel {
     active_cubes: ArchiveMaskGrid,
 }
 
-#[derive(Archive, Serialize)]
+#[derive(Archive, Deserialize, Serialize)]
 struct ArchiveF32Grid {
     bounds: [u32; 3],
     chunks: Vec<ArchiveF32Chunk>,
 }
 
-#[derive(Archive, Serialize)]
+#[derive(Archive, Deserialize, Serialize)]
 enum ArchiveF32Chunk {
     Uniform {
         key: [u32; 3],
@@ -101,13 +107,13 @@ enum ArchiveF32Chunk {
     },
 }
 
-#[derive(Archive, Serialize)]
+#[derive(Archive, Deserialize, Serialize)]
 struct ArchiveMaskGrid {
     bounds: [u32; 3],
     chunks: Vec<ArchiveMaskChunk>,
 }
 
-#[derive(Archive, Serialize)]
+#[derive(Archive, Deserialize, Serialize)]
 struct ArchiveMaskChunk {
     key: [u32; 3],
     mask: Box<[u64; crate::utility::MASK_WORDS]>,
@@ -221,6 +227,45 @@ impl CompactArchive {
                 .collect::<Result<Vec<_>>>()?,
         })
     }
+
+    fn into_compact_plot(self) -> Result<CompactPlot> {
+        ensure!(self.magic == FORMAT_MAGIC, "invalid compact archive magic");
+        ensure!(
+            self.version == FORMAT_VERSION,
+            "unsupported compact archive version {}",
+            self.version
+        );
+        ensure!(
+            self.chunk_bits == crate::utility::CHUNK_BITS,
+            "unsupported compact chunk size"
+        );
+
+        let variable_count = self.header.variables.len();
+        let component_ids = self
+            .component_ids
+            .into_iter()
+            .map(|id| {
+                let id = usize::try_from(id).context("component id does not fit in usize")?;
+                ensure!(
+                    id < variable_count,
+                    "component index {id} is out of range for archive"
+                );
+                Ok(id)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let levels = self
+            .levels
+            .into_iter()
+            .map(|level| level.into_compact_level(component_ids.len()))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(CompactPlot {
+            variable_count,
+            component_ids,
+            levels,
+        })
+    }
 }
 
 impl ArchiveHeader {
@@ -299,6 +344,26 @@ impl ArchiveLevel {
             active_cubes: ArchiveMaskGrid::from_grid(&level.active_cubes),
         })
     }
+
+    fn into_compact_level(self, component_count: usize) -> Result<CompactLevel> {
+        ensure!(
+            self.components.len() == component_count,
+            "archive level component count mismatch"
+        );
+        Ok(CompactLevel {
+            level_index: usize::try_from(self.level_index)
+                .context("level index does not fit in usize")?,
+            index_origin: array_to_ivec3(self.index_origin),
+            physical_origin: array_to_dvec3(self.physical_origin),
+            cell_size: array_to_dvec3(self.cell_size),
+            components: self
+                .components
+                .into_iter()
+                .map(ArchiveF32Grid::into_grid)
+                .collect::<Result<Vec<_>>>()?,
+            active_cubes: self.active_cubes.into_grid(),
+        })
+    }
 }
 
 impl ArchiveF32Grid {
@@ -325,6 +390,28 @@ impl ArchiveF32Grid {
             bounds: uvec3_to_array(grid.bounds()),
             chunks,
         })
+    }
+
+    fn into_grid(self) -> Result<SparseGrid3<f32>> {
+        let mut grid =
+            SparseGrid3::with_chunk_capacity(array_to_uvec3(self.bounds), self.chunks.len());
+        for chunk in self.chunks {
+            match chunk {
+                ArchiveF32Chunk::Uniform { key, value, mask } => {
+                    grid.insert_uniform_chunk(array_to_uvec3(key), value, *mask);
+                }
+                ArchiveF32Chunk::Dense { key, values, mask } => {
+                    ensure!(
+                        values.len() == crate::utility::CHUNK_VOLUME,
+                        "dense chunk has {} values; expected {}",
+                        values.len(),
+                        crate::utility::CHUNK_VOLUME
+                    );
+                    grid.insert_dense_chunk(array_to_uvec3(key), values.into_boxed_slice(), *mask);
+                }
+            }
+        }
+        Ok(grid)
     }
 }
 
@@ -354,6 +441,15 @@ impl ArchiveMaskGrid {
             chunks,
         }
     }
+
+    fn into_grid(self) -> SparseGrid3<()> {
+        let mut grid =
+            SparseGrid3::with_chunk_capacity(array_to_uvec3(self.bounds), self.chunks.len());
+        for chunk in self.chunks {
+            grid.insert_uniform_chunk(array_to_uvec3(chunk.key), (), *chunk.mask);
+        }
+        grid
+    }
 }
 
 fn selected_component_ids(plot_file: &PlotFile, options: &CompactOptions) -> Result<Vec<usize>> {
@@ -379,12 +475,24 @@ fn uvec3_to_array(v: UVec3) -> [u32; 3] {
     [v.x, v.y, v.z]
 }
 
+fn array_to_uvec3(v: [u32; 3]) -> UVec3 {
+    UVec3::new(v[0], v[1], v[2])
+}
+
 fn ivec3_to_array(v: IVec3) -> [i32; 3] {
     [v.x, v.y, v.z]
 }
 
+fn array_to_ivec3(v: [i32; 3]) -> IVec3 {
+    IVec3::new(v[0], v[1], v[2])
+}
+
 fn dvec3_to_array(v: DVec3) -> [f64; 3] {
     [v.x, v.y, v.z]
+}
+
+fn array_to_dvec3(v: [f64; 3]) -> DVec3 {
+    DVec3::new(v[0], v[1], v[2])
 }
 
 pub(crate) fn build_active_dual_cubes(
@@ -472,6 +580,18 @@ mod tests {
             let mut bytes = Vec::new();
             write_compact(&plotfile, CompactOptions::default(), &mut bytes)?;
             ensure!(!bytes.is_empty(), "compact archive is empty");
+
+            let compact = read_compact(&bytes)?;
+            let mesh = crate::isosurface_compact(
+                &compact,
+                crate::IsosurfaceOptions {
+                    surface: crate::Surface { id: 0, value: 0.5 },
+                    sampled_quantities: Vec::new(),
+                    method: crate::IsosurfaceMethod::Mc33,
+                },
+            )?;
+            ensure!(!mesh.positions.is_empty(), "expected extracted vertices");
+            ensure!(!mesh.faces.is_empty(), "expected extracted faces");
             Ok(())
         })();
 

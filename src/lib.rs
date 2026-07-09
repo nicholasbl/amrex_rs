@@ -4,7 +4,7 @@ pub mod isosurface;
 pub(crate) mod sparse_amr;
 pub mod utility;
 
-pub use compact::{CompactOptions, CompactPlot, write_compact};
+pub use compact::{CompactOptions, CompactPlot, read_compact, write_compact};
 pub use isosurface::{
     IsosurfaceMethod, IsosurfaceOptions, Mesh3D, Sample, Surface, Vertex3D, isosurface,
     isosurface_compact,

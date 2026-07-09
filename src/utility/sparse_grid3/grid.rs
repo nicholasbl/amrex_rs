@@ -113,6 +113,36 @@ where
         }
     }
 
+    pub(crate) fn insert_uniform_chunk(
+        &mut self,
+        key: UVec3,
+        value: T,
+        mask: [u64; super::MASK_WORDS],
+    ) {
+        self.chunks.insert(
+            ChunkKey::new(key.x, key.y, key.z),
+            Chunk::Uniform {
+                value,
+                mask: BitMask::from_words(mask),
+            },
+        );
+    }
+
+    pub(crate) fn insert_dense_chunk(
+        &mut self,
+        key: UVec3,
+        values: Box<[T]>,
+        mask: [u64; super::MASK_WORDS],
+    ) {
+        self.chunks.insert(
+            ChunkKey::new(key.x, key.y, key.z),
+            Chunk::Dense {
+                values,
+                mask: BitMask::from_words(mask),
+            },
+        );
+    }
+
     /// Counts present voxels by summing chunk masks.
     pub fn present_voxel_count(&self) -> usize {
         self.chunks.values().map(Chunk::present_count).sum()
