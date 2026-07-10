@@ -30,6 +30,22 @@ fn fill_crosses_chunks() {
 }
 
 #[test]
+fn chunk_aabbs_are_sorted_and_clipped_to_bounds() {
+    let mut grid = SparseGrid3::<u8>::new(UVec3::new(40, 40, 40));
+    grid.set(UVec3::new(35, 1, 1), 1);
+    grid.set(UVec3::new(1, 1, 1), 2);
+
+    let aabbs = grid.chunk_aabbs();
+    assert_eq!(
+        aabbs,
+        vec![
+            Aabb3u::new(UVec3::ZERO, UVec3::splat(32)),
+            Aabb3u::new(UVec3::new(32, 0, 0), UVec3::new(40, 32, 32)),
+        ]
+    );
+}
+
+#[test]
 fn write_values_x_fastest() {
     let mut grid = SparseGrid3::<u32>::new(UVec3::new(16, 16, 16));
     let aabb = Aabb3u::new(UVec3::new(1, 2, 3), UVec3::new(4, 4, 5));

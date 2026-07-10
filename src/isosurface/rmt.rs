@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use glam::{DVec3, UVec3, Vec3};
 
+use crate::utility::Aabb3u;
+
 use super::dual_grid::DualGridLevel;
 use super::sampling::{sampled_values_at, sampled_values_on_edge};
 use super::{Mesh3D, SampleRange, Vertex3D};
@@ -204,8 +206,9 @@ fn grid_point_le(a: UVec3, b: UVec3) -> bool {
     (a.x, a.y, a.z) <= (b.x, b.y, b.z)
 }
 
-pub(super) fn mesh_level(
+pub(super) fn mesh_level_aabb(
     level: &DualGridLevel<'_>,
+    active_aabb: Aabb3u,
     ranges: &[SampleRange],
     isovalue: f32,
     regularization: f32,
@@ -224,7 +227,7 @@ pub(super) fn mesh_level(
     let mut error = None;
     level
         .active_cubes
-        .for_each_present_in_aabb(level.active_cubes.bounds_aabb(), |anchor, ()| {
+        .for_each_present_in_aabb(active_aabb, |anchor, ()| {
             if error.is_none() {
                 error = mesher.march_cube(anchor).err();
             }

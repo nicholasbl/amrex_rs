@@ -113,6 +113,20 @@ where
         }
     }
 
+    pub(crate) fn chunk_aabbs(&self) -> Vec<Aabb3u> {
+        let mut aabbs = self
+            .chunks
+            .keys()
+            .filter_map(|&key| {
+                let chunk_min = key.world_min();
+                let chunk_max = super::layout::saturating_add_chunk_size(chunk_min);
+                Aabb3u::new(chunk_min, chunk_max).intersect(self.bounds_aabb())
+            })
+            .collect::<Vec<_>>();
+        aabbs.sort_by_key(|aabb| (aabb.min.z, aabb.min.y, aabb.min.x));
+        aabbs
+    }
+
     pub(crate) fn insert_uniform_chunk(
         &mut self,
         key: UVec3,

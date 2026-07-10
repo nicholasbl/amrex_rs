@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result, bail};
 use glam::{DVec3, UVec3};
 
+use crate::utility::Aabb3u;
+
 use super::dual_grid::DualGridLevel;
 use super::sampling::{sampled_values_on_edge, sampled_values_weighted};
 use super::{Mesh3D, SampleRange, Vertex3D};
@@ -232,8 +234,9 @@ impl Mc33Mesher<'_> {
     }
 }
 
-pub(super) fn mesh_level(
+pub(super) fn mesh_level_aabb(
     level: &DualGridLevel<'_>,
+    active_aabb: Aabb3u,
     ranges: &[SampleRange],
     isovalue: f32,
     mesh: &mut Mesh3D,
@@ -249,7 +252,7 @@ pub(super) fn mesh_level(
     let mut error = None;
     level
         .active_cubes
-        .for_each_present_in_aabb(level.active_cubes.bounds_aabb(), |anchor, ()| {
+        .for_each_present_in_aabb(active_aabb, |anchor, ()| {
             if error.is_none() {
                 error = mesher.march_cube(anchor).err();
             }

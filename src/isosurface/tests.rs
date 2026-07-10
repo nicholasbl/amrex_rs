@@ -1,8 +1,8 @@
 use std::{fs, fs::File, io::Write, path::Path};
 
 use super::dual_grid::{DualGridLevel, build_active_dual_cubes};
-use super::mc33::mesh_level as mesh_level_mc33;
-use super::rmt::mesh_level;
+use super::mc33::mesh_level_aabb as mesh_level_mc33_aabb;
+use super::rmt::mesh_level_aabb;
 use super::sampling::{sampled_values_at, sampled_values_on_edge};
 use super::*;
 use crate::sparse_amr::level_translation;
@@ -16,11 +16,12 @@ fn level_with_grids<'a>(
 ) -> DualGridLevel<'a> {
     DualGridLevel {
         level_index: 0,
+        index_origin: IVec3::ZERO,
         physical_origin: DVec3::ZERO,
         cell_size: DVec3::ONE,
         samples,
         sampled_quantities,
-        active_cubes,
+        active_cubes: active_cubes.clone(),
     }
 }
 
@@ -144,7 +145,15 @@ fn rmt_extracts_a_plane() {
         positions: Vec::new(),
         faces: Vec::new(),
     };
-    mesh_level(&level, &[], 0.5, 0.0, &mut mesh).unwrap();
+    mesh_level_aabb(
+        &level,
+        level.active_cubes.bounds_aabb(),
+        &[],
+        0.5,
+        0.0,
+        &mut mesh,
+    )
+    .unwrap();
 
     assert!(!mesh.positions.is_empty());
     assert!(!mesh.faces.is_empty());
@@ -178,7 +187,14 @@ fn mc33_extracts_a_plane_without_tetrahedral_diagonals() {
         positions: Vec::new(),
         faces: Vec::new(),
     };
-    mesh_level_mc33(&level, &[], 0.5, &mut mesh).unwrap();
+    mesh_level_mc33_aabb(
+        &level,
+        level.active_cubes.bounds_aabb(),
+        &[],
+        0.5,
+        &mut mesh,
+    )
+    .unwrap();
 
     assert_eq!(mesh.positions.len(), 4);
     assert_eq!(mesh.faces.len(), 2);
@@ -187,6 +203,50 @@ fn mc33_extracts_a_plane_without_tetrahedral_diagonals() {
             .iter()
             .all(|vertex| (vertex.position.x - 1.0).abs() < 1.0e-6)
     );
+}
+
+#[test]
+fn public_mesher_extracts_across_active_chunks() -> Result<()> {
+    let mut samples = SparseGrid3::new(UVec3::new(34, 2, 2));
+    samples.fill_aabb(samples.bounds_aabb(), 0.0);
+    for z in 0..2 {
+        for y in 0..2 {
+            for x in 17..34 {
+                samples.set(UVec3::new(x, y, z), 1.0);
+            }
+        }
+    }
+    let mut active_cubes = SparseGrid3::new(UVec3::new(33, 1, 1));
+    active_cubes.fill_aabb(active_cubes.bounds_aabb(), ());
+    let level = level_with_grids(&samples, Vec::new(), &active_cubes);
+    let compact = CompactPlot {
+        variable_count: 1,
+        refinement_ratios: Vec::new(),
+        component_ids: vec![0],
+        levels: vec![crate::compact::CompactLevel {
+            level_index: 0,
+            index_origin: IVec3::ZERO,
+            physical_origin: level.physical_origin,
+            cell_size: level.cell_size,
+            components: vec![samples],
+            eligible_cubes: active_cubes,
+        }],
+    };
+
+    let mesh = isosurface_compact(
+        &compact,
+        IsosurfaceOptions {
+            surface: Surface { id: 0, value: 0.5 },
+            sampled_quantities: Vec::new(),
+            method: IsosurfaceMethod::Mc33,
+            levels: None,
+            flip_winding: Vec::new(),
+        },
+    )?;
+
+    ensure!(!mesh.positions.is_empty(), "expected extracted vertices");
+    ensure!(!mesh.faces.is_empty(), "expected extracted faces");
+    Ok(())
 }
 
 #[test]
@@ -204,6 +264,8 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
                 surface: Surface { id: 0, value: 0.5 },
                 sampled_quantities: Vec::new(),
                 method: IsosurfaceMethod::Mc33,
+                levels: None,
+                flip_winding: Vec::new(),
             },
         )?;
         ensure!(!mesh.positions.is_empty(), "expected extracted vertices");
@@ -216,6 +278,8 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
                 surface: Surface { id: 0, value: 0.5 },
                 sampled_quantities: Vec::new(),
                 method: IsosurfaceMethod::Mc33,
+                levels: None,
+                flip_winding: Vec::new(),
             },
         )?;
         ensure!(
@@ -223,9 +287,47 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
             "expected compact extracted vertices"
         );
         ensure!(!mesh.faces.is_empty(), "expected compact extracted faces");
+
+        let mesh = isosurface_compact(
+            &compact,
+            IsosurfaceOptions {
+                surface: Surface { id: 0, value: 0.5 },
+                sampled_quantities: Vec::new(),
+                method: IsosurfaceMethod::Mc33,
+                levels: Some(0..=0),
+                flip_winding: Vec::new(),
+            },
+        )?;
+        ensure!(
+            !mesh.positions.is_empty(),
+            "expected selected level extracted vertices"
+        );
+
+        let mesh = isosurface_compact(
+            &compact,
+            IsosurfaceOptions {
+                surface: Surface { id: 0, value: 0.5 },
+                sampled_quantities: Vec::new(),
+                method: IsosurfaceMethod::Mc33,
+                levels: Some(1..=1),
+                flip_winding: Vec::new(),
+            },
+        )?;
+        ensure!(
+            mesh.positions.is_empty(),
+            "unexpected vertices from omitted level"
+        );
+        ensure!(mesh.faces.is_empty(), "unexpected faces from omitted level");
         Ok(())
     })();
 
     let _ = fs::remove_dir_all(&root);
     result
+}
+
+#[test]
+fn flip_face_winding_swaps_new_face_orientation() {
+    let mut faces = [UVec3::new(1, 2, 3), UVec3::new(4, 5, 6)];
+    flip_face_winding(&mut faces);
+    assert_eq!(faces, [UVec3::new(1, 3, 2), UVec3::new(4, 6, 5)]);
 }

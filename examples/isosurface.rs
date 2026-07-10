@@ -190,6 +190,8 @@ fn main() -> Result<()> {
             },
             sampled_quantities,
             method: args.method,
+            levels: None,
+            flip_winding: Vec::new(),
         },
     )?;
     write_obj(&args.output, &mesh, !args.samples.is_empty())?;

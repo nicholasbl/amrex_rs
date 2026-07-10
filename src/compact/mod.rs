@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use crate::sparse_amr::{SparseAmr, SparseAmrLevel, level_translation};
+use crate::sparse_amr::{SparseAmr, SparseAmrLevel};
 use crate::utility::{Aabb3u, SparseGrid3, SparseGridChunkView};
 use crate::{BoundingBox, CoordinateSystem, Header, IndexDomain, PlotFile, Variable};
 
@@ -121,6 +121,7 @@ struct ArchiveMaskChunk {
 
 pub struct CompactPlot {
     pub(crate) variable_count: usize,
+    pub(crate) refinement_ratios: Vec<usize>,
     pub(crate) component_ids: Vec<usize>,
     pub(crate) levels: Vec<CompactLevel>,
 }
@@ -131,7 +132,7 @@ pub(crate) struct CompactLevel {
     pub(crate) physical_origin: DVec3,
     pub(crate) cell_size: DVec3,
     pub(crate) components: Vec<SparseGrid3<f32>>,
-    pub(crate) active_cubes: SparseGrid3<()>,
+    pub(crate) eligible_cubes: SparseGrid3<()>,
 }
 
 impl CompactPlot {
@@ -157,41 +158,25 @@ impl CompactPlot {
                 index_type == IVec3::ZERO,
                 "compact plot extraction requires cell-centered data"
             );
-            let mut active_cubes = build_active_dual_cubes(
+            let eligible_cubes = build_active_dual_cubes(
                 components
                     .first()
                     .context("compact plot requires at least one component")?,
                 &valid_regions,
             );
-
-            if let Some(coarse) = levels.last_mut() {
-                let ratio = u32::try_from(plot_file.header().refinement_ratios[level_index - 1])
-                    .context("refinement ratio does not fit in u32")?;
-                ensure!(ratio > 0, "refinement ratio must be nonzero");
-
-                let translation = level_translation(coarse.index_origin, index_origin, ratio)?;
-                coarse.active_cubes.mask_out_by_presence_scaled(
-                    components
-                        .first()
-                        .context("compact plot requires at least one component")?,
-                    ratio,
-                    translation,
-                );
-            }
-
-            active_cubes.prune();
             levels.push(CompactLevel {
                 level_index,
                 index_origin,
                 physical_origin,
                 cell_size,
                 components,
-                active_cubes,
+                eligible_cubes,
             });
         }
 
         Ok(Self {
             variable_count: plot_file.variables().len(),
+            refinement_ratios: plot_file.header().refinement_ratios.clone(),
             component_ids: component_ids.to_vec(),
             levels,
         })
@@ -262,6 +247,14 @@ impl CompactArchive {
 
         Ok(CompactPlot {
             variable_count,
+            refinement_ratios: self
+                .header
+                .refinement_ratios
+                .into_iter()
+                .map(|ratio| {
+                    usize::try_from(ratio).context("refinement ratio does not fit in usize")
+                })
+                .collect::<Result<Vec<_>>>()?,
             component_ids,
             levels,
         })
@@ -341,7 +334,7 @@ impl ArchiveLevel {
                 .iter()
                 .map(ArchiveF32Grid::from_grid)
                 .collect::<Result<Vec<_>>>()?,
-            active_cubes: ArchiveMaskGrid::from_grid(&level.active_cubes),
+            active_cubes: ArchiveMaskGrid::from_grid(&level.eligible_cubes),
         })
     }
 
@@ -361,7 +354,7 @@ impl ArchiveLevel {
                 .into_iter()
                 .map(ArchiveF32Grid::into_grid)
                 .collect::<Result<Vec<_>>>()?,
-            active_cubes: self.active_cubes.into_grid(),
+            eligible_cubes: self.active_cubes.into_grid(),
         })
     }
 }
@@ -588,6 +581,8 @@ mod tests {
                     surface: crate::Surface { id: 0, value: 0.5 },
                     sampled_quantities: Vec::new(),
                     method: crate::IsosurfaceMethod::Mc33,
+                    levels: None,
+                    flip_winding: Vec::new(),
                 },
             )?;
             ensure!(!mesh.positions.is_empty(), "expected extracted vertices");

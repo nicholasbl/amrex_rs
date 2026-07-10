@@ -7,9 +7,11 @@ use std::ops::RangeInclusive;
 
 use anyhow::{Context, Result, ensure};
 use glam::{U16Vec2, UVec3, Vec3};
+use rayon::prelude::*;
 
 use crate::PlotFile;
 use crate::compact::CompactPlot;
+use crate::utility::Aabb3u;
 
 use dual_grid::{dual_grid_levels_from_compact, load_compact_for_isosurface};
 
@@ -30,6 +32,8 @@ pub struct IsosurfaceOptions {
     pub surface: Surface,
     pub sampled_quantities: Vec<Sample>,
     pub method: IsosurfaceMethod,
+    pub levels: Option<RangeInclusive<usize>>,
+    pub flip_winding: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -119,6 +123,12 @@ fn validate_isosurface_options(
     }
     let isovalue = options.surface.value as f32;
     ensure!(isovalue.is_finite(), "isovalue does not fit in f32");
+    if let Some(levels) = &options.levels {
+        ensure!(
+            levels.start() <= levels.end(),
+            "level range start must not exceed its end"
+        );
+    }
 
     let sample_specs = validate_sample_specs_for_len(variable_count, &options.sampled_quantities)?;
     Ok((component, isovalue, sample_specs))
@@ -145,7 +155,12 @@ pub fn isosurface_compact(
         .iter()
         .map(|sample| sample.component)
         .collect::<Vec<_>>();
-    let levels = dual_grid_levels_from_compact(compact_plot, component, &sampled_components)?;
+    let levels = dual_grid_levels_from_compact(
+        compact_plot,
+        component,
+        &sampled_components,
+        options.levels.as_ref(),
+    )?;
     let ranges = sample_specs
         .iter()
         .map(|sample| sample.range)
@@ -156,16 +171,84 @@ pub fn isosurface_compact(
     };
 
     for level in &levels {
-        match options.method {
-            IsosurfaceMethod::Mc33 => mc33::mesh_level(level, &ranges, isovalue, &mut mesh),
-            IsosurfaceMethod::Rmt { regularization } => {
-                rmt::mesh_level(level, &ranges, isovalue, regularization, &mut mesh)
-            }
+        let face_start = mesh.faces.len();
+        let level_mesh = mesh_level_parallel(level, &ranges, isovalue, options.method)
+            .with_context(|| format!("extracting level {}", level.level_index))?;
+        merge_mesh(&mut mesh, level_mesh)?;
+
+        if options.flip_winding.contains(&level.level_index) {
+            flip_face_winding(&mut mesh.faces[face_start..]);
         }
-        .with_context(|| format!("extracting level {}", level.level_index))?;
     }
 
     Ok(mesh)
+}
+
+fn mesh_level_parallel(
+    level: &dual_grid::DualGridLevel<'_>,
+    ranges: &[SampleRange],
+    isovalue: f32,
+    method: IsosurfaceMethod,
+) -> Result<Mesh3D> {
+    let chunk_aabbs = level.active_cubes.chunk_aabbs();
+    let mut chunks = chunk_aabbs
+        .into_par_iter()
+        .map(|active_aabb| {
+            let mut mesh = Mesh3D {
+                positions: Vec::new(),
+                faces: Vec::new(),
+            };
+            match method {
+                IsosurfaceMethod::Mc33 => {
+                    mc33::mesh_level_aabb(level, active_aabb, ranges, isovalue, &mut mesh)
+                }
+                IsosurfaceMethod::Rmt { regularization } => rmt::mesh_level_aabb(
+                    level,
+                    active_aabb,
+                    ranges,
+                    isovalue,
+                    regularization,
+                    &mut mesh,
+                ),
+            }?;
+            Ok((active_aabb, mesh))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    chunks.sort_by_key(|(aabb, _)| chunk_sort_key(*aabb));
+
+    let mut mesh = Mesh3D {
+        positions: Vec::new(),
+        faces: Vec::new(),
+    };
+    for (_, chunk_mesh) in chunks {
+        merge_mesh(&mut mesh, chunk_mesh)?;
+    }
+    Ok(mesh)
+}
+
+fn merge_mesh(dest: &mut Mesh3D, src: Mesh3D) -> Result<()> {
+    let base = u32::try_from(dest.positions.len()).context("mesh vertex count exceeds u32")?;
+    ensure!(
+        src.faces.iter().all(|face| {
+            face.x <= u32::MAX - base && face.y <= u32::MAX - base && face.z <= u32::MAX - base
+        }),
+        "mesh face index exceeds u32 after merge"
+    );
+
+    dest.positions.extend(src.positions);
+    dest.faces
+        .extend(src.faces.into_iter().map(|face| face + UVec3::splat(base)));
+    Ok(())
+}
+
+fn chunk_sort_key(aabb: Aabb3u) -> (u32, u32, u32) {
+    (aabb.min.z, aabb.min.y, aabb.min.x)
+}
+
+fn flip_face_winding(faces: &mut [UVec3]) {
+    for face in faces {
+        std::mem::swap(&mut face.y, &mut face.z);
+    }
 }
 
 #[cfg(test)]

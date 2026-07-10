@@ -7,4 +7,5 @@ edition = "2024"
 anyhow = "1"
 glam = "0.33"
 memmap2 = "0.9"
+rayon = "1"
 rkyv = { version = "0.8", features = ["bytecheck", "pointer_width_64", "std"] }
