@@ -1,3 +1,9 @@
+//! Utilities for reading AMReX plotfiles and extracting meshes from sparse AMR data.
+//!
+//! The crate exposes three common workflows:
+//! opening plotfile metadata with [`PlotFile`], reading component data with
+//! [`DataReader`], and extracting MC33 isosurfaces with [`isosurface()`].
+
 pub mod compact;
 mod input;
 pub mod isosurface;
@@ -6,8 +12,7 @@ pub mod utility;
 
 pub use compact::{CompactOptions, CompactPlot, read_compact, write_compact};
 pub use isosurface::{
-    IsosurfaceMethod, IsosurfaceOptions, Mesh3D, Sample, Surface, Vertex3D, isosurface,
-    isosurface_compact,
+    IsosurfaceOptions, Mesh3D, Sample, Surface, Vertex3D, isosurface, isosurface_compact,
 };
 
 pub use input::{

@@ -6,9 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use amrex_rs::{
-    IsosurfaceMethod, IsosurfaceOptions, Mesh3D, PlotFile, Sample, Surface, isosurface,
-};
+use amrex_rs::{IsosurfaceOptions, Mesh3D, PlotFile, Sample, Surface, isosurface};
 use anyhow::{Context, Result, bail, ensure};
 
 struct Args {
@@ -17,7 +15,6 @@ struct Args {
     isovalue: f64,
     output: PathBuf,
     samples: Vec<(String, RangeInclusive<f64>)>,
-    method: IsosurfaceMethod,
 }
 
 fn usage(program: &str) -> String {
@@ -26,8 +23,6 @@ fn usage(program: &str) -> String {
          \n\
          Options:\n\
            --sample <variable> <min> <max>  Map a quantity to U or V (repeat at most twice)\n\
-           --method <mc33|rmt>               Extraction method [default: mc33]\n\
-           --regularization <fraction>       RMT endpoint snap fraction [default: 0.25]\n\
            -h, --help                       Show this help"
     )
 }
@@ -53,8 +48,6 @@ fn parse_args() -> Result<Option<Args>> {
         .with_context(|| format!("invalid isovalue {:?}", values[2]))?;
     let output = PathBuf::from(&values[3]);
     let mut samples = Vec::new();
-    let mut method = "mc33";
-    let mut regularization = 0.25_f32;
     let mut index = 4;
 
     while index < values.len() {
@@ -75,25 +68,6 @@ fn parse_args() -> Result<Option<Args>> {
                 samples.push((name, min..=max));
                 index += 4;
             }
-            "--regularization" => {
-                ensure!(
-                    index + 1 < values.len(),
-                    "--regularization requires a fraction"
-                );
-                regularization = values[index + 1].parse::<f32>().with_context(|| {
-                    format!("invalid regularization fraction {:?}", values[index + 1])
-                })?;
-                index += 2;
-            }
-            "--method" => {
-                ensure!(index + 1 < values.len(), "--method requires mc33 or rmt");
-                method = values[index + 1].as_str();
-                ensure!(
-                    matches!(method, "mc33" | "rmt"),
-                    "unknown method {method:?}"
-                );
-                index += 2;
-            }
             option => bail!("unknown option {option:?}\n{}", usage(&program)),
         }
     }
@@ -104,11 +78,6 @@ fn parse_args() -> Result<Option<Args>> {
         isovalue,
         output,
         samples,
-        method: match method {
-            "mc33" => IsosurfaceMethod::Mc33,
-            "rmt" => IsosurfaceMethod::Rmt { regularization },
-            _ => unreachable!(),
-        },
     }))
 }
 
@@ -189,9 +158,8 @@ fn main() -> Result<()> {
                 value: args.isovalue,
             },
             sampled_quantities,
-            method: args.method,
             levels: None,
-            flip_winding: Vec::new(),
+            flip_winding: false,
         },
     )?;
     write_obj(&args.output, &mesh, !args.samples.is_empty())?;

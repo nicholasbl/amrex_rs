@@ -14,7 +14,9 @@ use super::{
 /// Errors returned by fallible bulk operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GridError {
+    /// The requested AABB volume does not fit in `usize`.
     AabbVolumeDoesNotFitUsize,
+    /// The supplied dense value slice length did not match the AABB volume.
     ValuesLengthMismatch { expected: usize, actual: usize },
 }
 
@@ -68,26 +70,31 @@ where
     }
 
     #[inline]
+    /// Grid bounds as exclusive coordinate limits.
     pub fn bounds(&self) -> UVec3 {
         self.bounds
     }
 
     #[inline]
+    /// Grid bounds as the half-open AABB `[0, bounds)`.
     pub fn bounds_aabb(&self) -> Aabb3u {
         Aabb3u::full_grid(self.bounds)
     }
 
     #[inline]
+    /// True when `p` lies inside `[0, bounds)`.
     pub fn is_in_bounds(&self, p: UVec3) -> bool {
         p.x < self.bounds.x && p.y < self.bounds.y && p.z < self.bounds.z
     }
 
     #[inline]
+    /// True when the grid has no allocated chunks.
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
 
     #[inline]
+    /// Number of allocated chunks.
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
@@ -599,6 +606,7 @@ where
     }
 
     #[inline]
+    /// Return a copied value, reusing the cached chunk when possible.
     pub fn get(&mut self, pos: UVec3) -> Option<T> {
         if !self.grid.is_in_bounds(pos) {
             return None;
@@ -615,6 +623,7 @@ where
     }
 
     #[inline]
+    /// True when the coordinate is present, reusing the cached chunk when possible.
     pub fn contains(&mut self, pos: UVec3) -> bool {
         self.get(pos).is_some()
     }
@@ -642,21 +651,25 @@ where
     }
 
     #[inline]
+    /// Return a copied value from the underlying grid.
     pub fn get(&self, pos: UVec3) -> Option<T> {
         self.grid.get(pos)
     }
 
     #[inline]
+    /// True when the coordinate is present in the underlying grid.
     pub fn contains(&self, pos: UVec3) -> bool {
         self.grid.contains(pos)
     }
 
     #[inline]
+    /// Set one voxel in the underlying grid.
     pub fn set(&mut self, pos: UVec3, value: T) -> bool {
         self.grid.set(pos, value)
     }
 
     #[inline]
+    /// Clear one voxel in the underlying grid.
     pub fn clear(&mut self, pos: UVec3) -> bool {
         self.grid.clear(pos)
     }

@@ -1,3 +1,8 @@
+//! Compact sparse AMR archive support.
+//!
+//! Compact archives store selected components in a chunked sparse layout that
+//! can be reused by isosurface extraction without rereading AMReX FAB shards.
+
 use std::io::Write;
 
 use crate::sparse_amr::{SparseAmr, SparseAmrLevel};
@@ -11,11 +16,17 @@ use rkyv::{Archive, Deserialize, Serialize, rancor::Error};
 const FORMAT_MAGIC: [u8; 8] = *b"AMRCMPCT";
 const FORMAT_VERSION: u32 = 1;
 
+/// Options controlling which data are written to a compact archive.
 #[derive(Debug, Default)]
 pub struct CompactOptions {
+    /// Component ids to include. Empty means all plotfile variables.
     pub component_ids: Vec<u32>,
 }
 
+/// Write selected plotfile components as a compact binary archive.
+///
+/// The archive format is intended for this crate's reader and may evolve while
+/// the crate is pre-1.0.
 pub fn write_compact(
     plot_file: &PlotFile,
     options: CompactOptions,
@@ -28,6 +39,7 @@ pub fn write_compact(
     dest.write_all(&bytes).context("writing compact plot")
 }
 
+/// Read a compact binary archive produced by [`write_compact`].
 pub fn read_compact(bytes: &[u8]) -> Result<CompactPlot> {
     let archive =
         rkyv::from_bytes::<CompactArchive, Error>(bytes).context("reading compact archive")?;
@@ -119,6 +131,10 @@ struct ArchiveMaskChunk {
     mask: Box<[u64; crate::utility::MASK_WORDS]>,
 }
 
+/// Sparse AMR data loaded from a plotfile or compact archive.
+///
+/// A `CompactPlot` stores selected components as sparse grids per AMR level and
+/// precomputes dual-cell eligibility used by isosurface extraction.
 pub struct CompactPlot {
     pub(crate) variable_count: usize,
     pub(crate) refinement_ratios: Vec<usize>,
@@ -136,6 +152,10 @@ pub(crate) struct CompactLevel {
 }
 
 impl CompactPlot {
+    /// Load selected component ids from an AMReX plotfile into sparse AMR storage.
+    ///
+    /// `component_ids` are plotfile variable indices. At least one component is
+    /// required because the first component defines active dual cubes.
     pub fn load(plot_file: &PlotFile, component_ids: &[usize]) -> Result<Self> {
         let sparse_amr = SparseAmr::load(plot_file, component_ids)?;
         ensure!(
@@ -182,6 +202,7 @@ impl CompactPlot {
         })
     }
 
+    /// Number of variables in the original plotfile.
     pub fn variable_count(&self) -> usize {
         self.variable_count
     }
@@ -580,9 +601,8 @@ mod tests {
                 crate::IsosurfaceOptions {
                     surface: crate::Surface { id: 0, value: 0.5 },
                     sampled_quantities: Vec::new(),
-                    method: crate::IsosurfaceMethod::Mc33,
                     levels: None,
-                    flip_winding: Vec::new(),
+                    flip_winding: false,
                 },
             )?;
             ensure!(!mesh.positions.is_empty(), "expected extracted vertices");

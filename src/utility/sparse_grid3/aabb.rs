@@ -8,11 +8,15 @@ pub struct Aabb3u {
 }
 
 impl Aabb3u {
+    /// Construct a half-open box from minimum and maximum coordinates.
     #[inline]
     pub const fn new(min: UVec3, max: UVec3) -> Self {
         Self { min, max }
     }
 
+    /// Construct a half-open box from minimum coordinate and extent.
+    ///
+    /// The maximum coordinate is saturating to avoid integer overflow.
     #[inline]
     pub fn from_min_extent(min: UVec3, extent: UVec3) -> Self {
         Self {
@@ -25,6 +29,7 @@ impl Aabb3u {
         }
     }
 
+    /// Construct the full-grid box `[0, bounds)`.
     #[inline]
     pub fn full_grid(bounds: UVec3) -> Self {
         Self {
@@ -33,6 +38,7 @@ impl Aabb3u {
         }
     }
 
+    /// Return the saturating extent of the box.
     #[inline]
     pub fn extent(self) -> UVec3 {
         UVec3::new(
@@ -42,11 +48,13 @@ impl Aabb3u {
         )
     }
 
+    /// True when at least one axis has no positive width.
     #[inline]
     pub fn is_empty(self) -> bool {
         self.max.x <= self.min.x || self.max.y <= self.min.y || self.max.z <= self.min.z
     }
 
+    /// True when `p` lies inside the half-open box.
     #[inline]
     pub fn contains_point(self, p: UVec3) -> bool {
         p.x >= self.min.x
@@ -57,6 +65,7 @@ impl Aabb3u {
             && p.z < self.max.z
     }
 
+    /// Return the non-empty intersection of two boxes.
     #[inline]
     pub fn intersect(self, other: Self) -> Option<Self> {
         let min = UVec3::new(

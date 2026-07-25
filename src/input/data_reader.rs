@@ -13,9 +13,12 @@ use memmap2::{Mmap, MmapOptions};
 
 use super::native_file::{Level, Patch, Patches, PlotFile, Variable};
 
+/// Scalar encoding used by a FAB component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarType {
+    /// 32-bit floating point values.
     F32,
+    /// 64-bit floating point values.
     F64,
 }
 
@@ -28,9 +31,12 @@ impl ScalarType {
     }
 }
 
+/// Byte order used by a FAB component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByteOrder {
+    /// Little-endian encoding.
     LittleEndian,
+    /// Big-endian encoding.
     BigEndian,
 }
 
@@ -57,6 +63,10 @@ impl<'a> DataReader<'a> {
         }
     }
 
+    /// Read one component from a patch.
+    ///
+    /// The returned view borrows the reader's memory map cache by reference
+    /// counted handle, so it may outlive this method call.
     pub fn component(&self, patch: Patch<'_>, component: usize) -> Result<ComponentView> {
         ensure!(
             std::ptr::eq(self.plot_file, patch.plot_file),
@@ -73,10 +83,12 @@ impl<'a> DataReader<'a> {
             .with_context(|| format!("reading component {component} from {}", path.display()))
     }
 
+    /// Read a named variable from a patch.
     pub fn variable(&self, patch: Patch<'_>, variable: &Variable) -> Result<ComponentView> {
         self.component(patch, variable.index)
     }
 
+    /// Iterate over one component for every patch on a level.
     pub fn level_components<'reader>(
         &'reader self,
         level: Level<'a>,
@@ -124,6 +136,7 @@ impl<'a> DataReader<'a> {
     }
 }
 
+/// Iterator over component views for every patch on a level.
 pub struct LevelComponents<'reader, 'plot> {
     reader: &'reader DataReader<'plot>,
     patches: Patches<'plot>,
@@ -149,6 +162,10 @@ impl<'plot> Iterator for LevelComponents<'_, 'plot> {
 
 impl ExactSizeIterator for LevelComponents<'_, '_> {}
 
+/// Read-only view of one component's dense FAB values for a patch.
+///
+/// Values are x-fastest, then y, then z. Index-based access uses AMReX integer
+/// coordinates, including any ghost-cell origin present in the FAB.
 #[derive(Clone)]
 pub struct ComponentView {
     mapping: Arc<Mmap>,
@@ -160,34 +177,42 @@ pub struct ComponentView {
 }
 
 impl ComponentView {
+    /// Dense shape as `[nx, ny, nz]`.
     pub fn shape(&self) -> [usize; 3] {
         self.shape
     }
 
+    /// Integer origin of this dense view.
     pub fn origin(&self) -> IVec3 {
         self.origin
     }
 
+    /// Component index represented by this view.
     pub fn component(&self) -> usize {
         self.component
     }
 
+    /// Scalar type stored by the underlying FAB record.
     pub fn scalar_type(&self) -> ScalarType {
         self.encoding.scalar
     }
 
+    /// Byte order stored by the underlying FAB record.
     pub fn byte_order(&self) -> ByteOrder {
         self.encoding.byte_order
     }
 
+    /// Number of scalar values in the view.
     pub fn len(&self) -> usize {
         self.shape[0] * self.shape[1] * self.shape[2]
     }
 
+    /// True when the view contains no values.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Iterate over decoded values as `f64`.
     pub fn values(&self) -> Values<'_> {
         Values {
             bytes: self.bytes(),
@@ -197,10 +222,12 @@ impl ComponentView {
         }
     }
 
+    /// Decode a value by x-fastest linear index.
     pub fn get_linear(&self, index: usize) -> Option<f64> {
         (index < self.len()).then(|| decode(self.bytes(), self.encoding, index))
     }
 
+    /// Decode a value by AMReX integer coordinate.
     pub fn get(&self, index: IVec3) -> Option<f64> {
         let local = index - self.origin;
         if local.cmplt(IVec3::ZERO).any()
@@ -217,6 +244,8 @@ impl ComponentView {
     }
 
     /// Return a direct slice only for aligned, native-endian 64-bit data.
+    ///
+    /// Returns `None` for big-endian data, f32 data, or unaligned mappings.
     pub fn as_f64_slice(&self) -> Option<&[f64]> {
         if self.encoding.scalar != ScalarType::F64
             || self.encoding.byte_order != native_byte_order()
@@ -238,6 +267,7 @@ impl ComponentView {
         })
     }
 
+    /// Return the raw encoded bytes for this component.
     pub fn as_bytes(&self) -> &[u8] {
         self.bytes()
     }
@@ -247,6 +277,7 @@ impl ComponentView {
     }
 }
 
+/// Iterator that decodes component values as `f64`.
 pub struct Values<'a> {
     bytes: &'a [u8],
     encoding: Encoding,

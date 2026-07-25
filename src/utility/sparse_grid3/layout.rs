@@ -2,11 +2,20 @@ use glam::{I64Vec3, UVec3};
 
 use super::{Aabb3u, CHUNK_BITS, CHUNK_MASK, CHUNK_SIZE, CHUNK_VOLUME};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ChunkKey {
     pub(super) x: u32,
     pub(super) y: u32,
     pub(super) z: u32,
+}
+
+impl std::hash::Hash for ChunkKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let xy = ((self.x as u64) << 32) | self.y as u64;
+
+        state.write_u64(xy);
+        state.write_u32(self.z);
+    }
 }
 
 impl ChunkKey {

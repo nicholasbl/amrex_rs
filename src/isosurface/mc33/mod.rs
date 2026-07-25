@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result, bail};
 use glam::{DVec3, UVec3};
 
-use crate::utility::Aabb3u;
+use crate::utility::{Aabb3u, GridAccessor};
 
 use super::dual_grid::DualGridLevel;
 use super::sampling::{sampled_values_on_edge, sampled_values_weighted};
@@ -90,6 +90,8 @@ impl Tiling {
 
 struct Mc33Mesher<'a> {
     level: &'a DualGridLevel<'a>,
+    samples: GridAccessor<'a, f32>,
+    sampled_quantities: Vec<GridAccessor<'a, f32>>,
     ranges: &'a [SampleRange],
     isovalue: f32,
     mesh: &'a mut Mesh3D,
@@ -104,8 +106,7 @@ impl Mc33Mesher<'_> {
         let mut case_index = 0_usize;
         for (index, (&corner, value)) in corners.iter().zip(&mut values).enumerate() {
             *value = f64::from(
-                self.level
-                    .samples
+                self.samples
                     .get(corner)
                     .with_context(|| format!("surface sample is absent at {corner:?}"))?,
             ) - f64::from(self.isovalue);
@@ -142,30 +143,27 @@ impl Mc33Mesher<'_> {
             .context("MC33 tiling edge is out of range")?;
         let first = corners[first_index];
         let second = corners[second_index];
-        let (start, end) = if grid_point_le(first, second) {
-            (first, second)
+        let first_value = values[first_index] + f64::from(self.isovalue);
+        let second_value = values[second_index] + f64::from(self.isovalue);
+        let (start, start_value, end, end_value) = if grid_point_le(first, second) {
+            (first, first_value, second, second_value)
         } else {
-            (second, first)
+            (second, second_value, first, first_value)
         };
         let key = VertexKey::Edge(start, end);
         if let Some(&id) = self.vertex_ids.get(&key) {
             return Ok(id);
         }
 
-        let start_value = self
-            .level
-            .samples
-            .get(start)
-            .context("missing edge start")?;
-        let end_value = self.level.samples.get(end).context("missing edge end")?;
         let denominator = end_value - start_value;
         let t = if denominator == 0.0 {
             0.5
         } else {
-            ((self.isovalue - start_value) / denominator).clamp(0.0, 1.0)
+            ((f64::from(self.isovalue) - start_value) / denominator).clamp(0.0, 1.0) as f32
         };
         let position = self.grid_position(start.as_dvec3().lerp(end.as_dvec3(), f64::from(t)));
-        let sampled_values = sampled_values_on_edge(self.level, start, end, t, self.ranges)?;
+        let sampled_values =
+            sampled_values_on_edge(&mut self.sampled_quantities, start, end, t, self.ranges)?;
         self.insert_vertex(
             key,
             Vertex3D {
@@ -193,7 +191,8 @@ impl Mc33Mesher<'_> {
             grid_position += corner.as_dvec3() * weight;
         }
         grid_position /= weight_sum;
-        let sampled_values = sampled_values_weighted(self.level, corners, &weights, self.ranges)?;
+        let sampled_values =
+            sampled_values_weighted(&mut self.sampled_quantities, corners, &weights, self.ranges)?;
         self.insert_vertex(
             key,
             Vertex3D {
@@ -243,6 +242,12 @@ pub(super) fn mesh_level_aabb(
 ) -> Result<()> {
     let mut mesher = Mc33Mesher {
         level,
+        samples: level.samples.accessor(),
+        sampled_quantities: level
+            .sampled_quantities
+            .iter()
+            .map(|grid| grid.accessor())
+            .collect(),
         ranges,
         isovalue,
         mesh,

@@ -6,6 +6,7 @@ use glam::prelude::*;
 
 use super::{native_file::*, text_parsing::*};
 
+/// Read and parse a top-level AMReX plotfile `Header`.
 pub fn read_header(path: impl AsRef<Path>) -> Result<Header> {
     let mut reader = Reader::new(path)?;
 
@@ -213,6 +214,7 @@ fn read_hyper(lines: &mut Reader) -> Result<Header> {
     })
 }
 
+/// Read and parse a per-level AMReX `Cell_H` file.
 pub fn read_hyper_cell_header(path: impl AsRef<Path>) -> Result<CellHeader> {
     let mut reader = Reader::new(path)?;
 
