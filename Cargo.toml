@@ -1,0 +1,11 @@
+[package]
+name = "amrex_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+glam = "0.33"
+memmap2 = "0.9"
+rayon = "1"
+rkyv = { version = "0.8", features = ["bytecheck", "pointer_width_64", "std"] }
