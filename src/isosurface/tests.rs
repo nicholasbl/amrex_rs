@@ -152,7 +152,7 @@ fn mc33_extracts_a_plane_without_tetrahedral_diagonals() {
     assert!(
         mesh.positions
             .iter()
-            .all(|position| (position.x - 1.0).abs() < 1.0e-6)
+            .all(|position| (position[0] - 1.0).abs() < 1.0e-6)
     );
     assert!(
         mesh.indices
@@ -281,9 +281,9 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
 
 #[test]
 fn flip_face_winding_swaps_new_face_orientation() {
-    let mut faces = [UVec3::new(1, 2, 3), UVec3::new(4, 5, 6)];
+    let mut faces = [[1, 2, 3], [4, 5, 6]];
     flip_face_winding(&mut faces);
-    assert_eq!(faces, [UVec3::new(1, 3, 2), UVec3::new(4, 6, 5)]);
+    assert_eq!(faces, [[1, 3, 2], [4, 6, 5]]);
 }
 
 #[test]
@@ -351,9 +351,9 @@ fn single_plane_compact() -> CompactPlot {
     }
 }
 
-fn triangle_normal(positions: &[Vec3], face: UVec3) -> Vec3 {
-    let a = positions[face.x as usize];
-    let b = positions[face.y as usize];
-    let c = positions[face.z as usize];
+fn triangle_normal(positions: &[[f32; 3]], face: [u32; 3]) -> Vec3 {
+    let a = Vec3::from_array(positions[face[0] as usize]);
+    let b = Vec3::from_array(positions[face[1] as usize]);
+    let c = Vec3::from_array(positions[face[2] as usize]);
     (b - a).cross(c - a)
 }

@@ -199,7 +199,7 @@ impl Mc33Mesher<'_> {
     ) -> Result<u32> {
         let id =
             u32::try_from(self.mesh.positions.len()).context("mesh vertex count exceeds u32")?;
-        self.mesh.positions.push(position);
+        self.mesh.positions.push(position.to_array());
         self.mesh.uv.push(sampled_values_to_uv(sampled_values));
         self.vertex_ids.insert(key, id);
         Ok(id)
@@ -214,9 +214,9 @@ impl Mc33Mesher<'_> {
         if a == b || b == c || c == a {
             return;
         }
-        let pa = self.mesh.positions[a as usize];
-        let pb = self.mesh.positions[b as usize];
-        let pc = self.mesh.positions[c as usize];
+        let pa = Vec3::from_array(self.mesh.positions[a as usize]);
+        let pb = Vec3::from_array(self.mesh.positions[b as usize]);
+        let pc = Vec3::from_array(self.mesh.positions[c as usize]);
         let normal = (pb - pa).cross(pc - pa);
         if normal.dot(quantity_gradient) > 0.0 {
             std::mem::swap(&mut b, &mut c);
@@ -227,18 +227,18 @@ impl Mc33Mesher<'_> {
         let mut key = [a, b, c];
         key.sort_unstable();
         if self.face_ids.insert(key) {
-            self.mesh.indices.push(UVec3::new(a, b, c));
+            self.mesh.indices.push([a, b, c]);
         }
     }
 }
 
-fn sampled_values_to_uv(sampled_values: U16Vec2) -> Vec3 {
+fn sampled_values_to_uv(sampled_values: U16Vec2) -> [f32; 3] {
     let scale = 1.0 / f32::from(u16::MAX);
-    Vec3::new(
+    [
         f32::from(sampled_values.x) * scale,
         f32::from(sampled_values.y) * scale,
         0.0,
-    )
+    ]
 }
 
 fn cube_quantity_gradient(values: &[f64; 8], cell_size: DVec3) -> Vec3 {

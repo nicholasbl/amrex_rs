@@ -11,7 +11,6 @@ mod sampling;
 use std::ops::RangeInclusive;
 
 use anyhow::{Context, Result, ensure};
-use glam::{UVec3, Vec3};
 use rayon::prelude::*;
 
 use crate::PlotFile;
@@ -55,11 +54,11 @@ pub struct IsosurfaceOptions {
 #[derive(Debug, Default)]
 pub struct Mesh3D {
     /// Physical-space vertex positions.
-    pub positions: Vec<Vec3>,
+    pub positions: Vec<[f32; 3]>,
     /// Per-vertex texture coordinates. Indices match `positions`.
-    pub uv: Vec<Vec3>,
+    pub uv: Vec<[f32; 3]>,
     /// Triangle vertex indices.
-    pub indices: Vec<UVec3>,
+    pub indices: Vec<[u32; 3]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -219,7 +218,7 @@ fn merge_mesh(dest: &mut Mesh3D, src: Mesh3D) -> Result<()> {
     );
     ensure!(
         src.indices.iter().all(|face| {
-            face.x <= u32::MAX - base && face.y <= u32::MAX - base && face.z <= u32::MAX - base
+            face[0] <= u32::MAX - base && face[1] <= u32::MAX - base && face[2] <= u32::MAX - base
         }),
         "mesh face index exceeds u32 after merge"
     );
@@ -229,7 +228,7 @@ fn merge_mesh(dest: &mut Mesh3D, src: Mesh3D) -> Result<()> {
     dest.indices.extend(
         src.indices
             .into_iter()
-            .map(|face| face + UVec3::splat(base)),
+            .map(|face| [face[0] + base, face[1] + base, face[2] + base]),
     );
     Ok(())
 }
@@ -238,9 +237,9 @@ fn chunk_sort_key(aabb: Aabb3u) -> (u32, u32, u32) {
     (aabb.min.z, aabb.min.y, aabb.min.x)
 }
 
-fn flip_face_winding(faces: &mut [UVec3]) {
+fn flip_face_winding(faces: &mut [[u32; 3]]) {
     for face in faces {
-        std::mem::swap(&mut face.y, &mut face.z);
+        face.swap(1, 2);
     }
 }
 
