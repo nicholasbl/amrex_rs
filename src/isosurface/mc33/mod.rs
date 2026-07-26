@@ -8,13 +8,13 @@ mod tables;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
-use glam::{DVec3, UVec3};
+use glam::{DVec3, U16Vec2, UVec3, Vec3};
 
 use crate::utility::{Aabb3u, GridAccessor};
 
 use super::dual_grid::DualGridLevel;
 use super::sampling::{sampled_values_on_edge, sampled_values_weighted};
-use super::{Mesh3D, SampleRange, Vertex3D};
+use super::{Mesh3D, SampleRange};
 use tables::*;
 
 const EPSILON: f64 = f32::EPSILON as f64;
@@ -118,11 +118,12 @@ impl Mc33Mesher<'_> {
         let Some(tiling) = resolve_tiling(case_index, &values)? else {
             return Ok(());
         };
+        let quantity_gradient = cube_quantity_gradient(&values, self.level.cell_size);
         for triangle in 0..tiling.triangle_count {
             let a = self.vertex(anchor, &corners, &values, tiling.edge(triangle * 3))?;
             let b = self.vertex(anchor, &corners, &values, tiling.edge(triangle * 3 + 1))?;
             let c = self.vertex(anchor, &corners, &values, tiling.edge(triangle * 3 + 2))?;
-            self.emit_face(a, b, c);
+            self.emit_face(a, b, c, quantity_gradient);
         }
         Ok(())
     }
@@ -164,13 +165,7 @@ impl Mc33Mesher<'_> {
         let position = self.grid_position(start.as_dvec3().lerp(end.as_dvec3(), f64::from(t)));
         let sampled_values =
             sampled_values_on_edge(&mut self.sampled_quantities, start, end, t, self.ranges)?;
-        self.insert_vertex(
-            key,
-            Vertex3D {
-                position,
-                sampled_values,
-            },
-        )
+        self.insert_vertex(key, position, sampled_values)
     }
 
     fn interior_vertex(
@@ -193,19 +188,19 @@ impl Mc33Mesher<'_> {
         grid_position /= weight_sum;
         let sampled_values =
             sampled_values_weighted(&mut self.sampled_quantities, corners, &weights, self.ranges)?;
-        self.insert_vertex(
-            key,
-            Vertex3D {
-                position: self.grid_position(grid_position),
-                sampled_values,
-            },
-        )
+        self.insert_vertex(key, self.grid_position(grid_position), sampled_values)
     }
 
-    fn insert_vertex(&mut self, key: VertexKey, vertex: Vertex3D) -> Result<u32> {
+    fn insert_vertex(
+        &mut self,
+        key: VertexKey,
+        position: Vec3,
+        sampled_values: U16Vec2,
+    ) -> Result<u32> {
         let id =
             u32::try_from(self.mesh.positions.len()).context("mesh vertex count exceeds u32")?;
-        self.mesh.positions.push(vertex);
+        self.mesh.positions.push(position);
+        self.mesh.uv.push(sampled_values_to_uv(sampled_values));
         self.vertex_ids.insert(key, id);
         Ok(id)
     }
@@ -215,22 +210,48 @@ impl Mc33Mesher<'_> {
             .as_vec3()
     }
 
-    fn emit_face(&mut self, a: u32, b: u32, c: u32) {
+    fn emit_face(&mut self, a: u32, mut b: u32, mut c: u32, quantity_gradient: Vec3) {
         if a == b || b == c || c == a {
             return;
         }
-        let pa = self.mesh.positions[a as usize].position;
-        let pb = self.mesh.positions[b as usize].position;
-        let pc = self.mesh.positions[c as usize].position;
+        let pa = self.mesh.positions[a as usize];
+        let pb = self.mesh.positions[b as usize];
+        let pc = self.mesh.positions[c as usize];
+        let normal = (pb - pa).cross(pc - pa);
+        if normal.dot(quantity_gradient) > 0.0 {
+            std::mem::swap(&mut b, &mut c);
+        }
         if (pb - pa).cross(pc - pa).length_squared() == 0.0 {
             return;
         }
         let mut key = [a, b, c];
         key.sort_unstable();
         if self.face_ids.insert(key) {
-            self.mesh.faces.push(UVec3::new(a, b, c));
+            self.mesh.indices.push(UVec3::new(a, b, c));
         }
     }
+}
+
+fn sampled_values_to_uv(sampled_values: U16Vec2) -> Vec3 {
+    let scale = 1.0 / f32::from(u16::MAX);
+    Vec3::new(
+        f32::from(sampled_values.x) * scale,
+        f32::from(sampled_values.y) * scale,
+        0.0,
+    )
+}
+
+fn cube_quantity_gradient(values: &[f64; 8], cell_size: DVec3) -> Vec3 {
+    let gx = ((values[1] + values[2] + values[5] + values[6])
+        - (values[0] + values[3] + values[4] + values[7]))
+        / (4.0 * cell_size.x);
+    let gy = ((values[2] + values[3] + values[6] + values[7])
+        - (values[0] + values[1] + values[4] + values[5]))
+        / (4.0 * cell_size.y);
+    let gz = ((values[4] + values[5] + values[6] + values[7])
+        - (values[0] + values[1] + values[2] + values[3]))
+        / (4.0 * cell_size.z);
+    DVec3::new(gx, gy, gz).as_vec3()
 }
 
 pub(super) fn mesh_level_aabb(

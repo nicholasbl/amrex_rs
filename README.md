@@ -65,7 +65,11 @@ let mesh = isosurface(
         flip_winding: false,
     },
 )?;
-println!("{} vertices, {} faces", mesh.positions.len(), mesh.faces.len());
+println!(
+    "{} vertices, {} triangles",
+    mesh.positions.len(),
+    mesh.indices.len()
+);
 ```
 
 ## OBJ Example
@@ -77,7 +81,7 @@ cargo run --example isosurface -- \
   /path/to/plt00010 density 1.0 surface.obj
 ```
 
-Up to two additional variables can be sampled onto vertices and written as OBJ texture coordinates:
+Up to two additional variables can be sampled onto `mesh.uv` and written as OBJ texture coordinates:
 
 ```sh
 cargo run --example isosurface -- \

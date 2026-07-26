@@ -1,7 +1,7 @@
 //! MC33 isosurface extraction for AMReX plotfiles and compact archives.
 //!
 //! The extractor operates on cell-centered scalar data. Optional sampled
-//! quantities are interpolated onto vertices and encoded as two unorm16 texture
+//! quantities are interpolated onto vertices and emitted as normalized texture
 //! coordinate channels.
 
 mod dual_grid;
@@ -11,7 +11,7 @@ mod sampling;
 use std::ops::RangeInclusive;
 
 use anyhow::{Context, Result, ensure};
-use glam::{U16Vec2, UVec3, Vec3};
+use glam::{UVec3, Vec3};
 use rayon::prelude::*;
 
 use crate::PlotFile;
@@ -34,7 +34,7 @@ pub struct Surface {
 pub struct Sample {
     /// Component id in the plotfile variable list.
     pub id: u32,
-    /// Value range mapped to `[0, 1]` before unorm16 encoding.
+    /// Value range mapped to `[0, 1]` for texture coordinates.
     pub range: RangeInclusive<f64>,
 }
 
@@ -43,7 +43,7 @@ pub struct Sample {
 pub struct IsosurfaceOptions {
     /// Surface component and threshold.
     pub surface: Surface,
-    /// Up to two additional components sampled into vertex `sampled_values`.
+    /// Up to two additional components sampled into vertex `uv`.
     pub sampled_quantities: Vec<Sample>,
     /// Optional inclusive AMR level range to extract.
     pub levels: Option<RangeInclusive<usize>>,
@@ -52,21 +52,14 @@ pub struct IsosurfaceOptions {
 }
 
 /// Triangle mesh produced by isosurface extraction.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Mesh3D {
-    /// Vertex data. Face indices refer into this array.
-    pub positions: Vec<Vertex3D>,
+    /// Physical-space vertex positions.
+    pub positions: Vec<Vec3>,
+    /// Per-vertex texture coordinates. Indices match `positions`.
+    pub uv: Vec<Vec3>,
     /// Triangle vertex indices.
-    pub faces: Vec<UVec3>,
-}
-
-/// One generated mesh vertex.
-#[derive(Debug)]
-pub struct Vertex3D {
-    /// Physical-space vertex position.
-    pub position: Vec3,
-    /// Up to two sampled quantities encoded as unorm16 values.
-    pub sampled_values: U16Vec2,
+    pub indices: Vec<UVec3>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,19 +172,16 @@ pub fn isosurface_compact(
         .iter()
         .map(|sample| sample.range)
         .collect::<Vec<_>>();
-    let mut mesh = Mesh3D {
-        positions: Vec::new(),
-        faces: Vec::new(),
-    };
+    let mut mesh = Mesh3D::default();
 
     for level in &levels {
-        let face_start = mesh.faces.len();
+        let index_start = mesh.indices.len();
         let level_mesh = mesh_level_parallel(level, &ranges, isovalue)
             .with_context(|| format!("extracting level {}", level.level_index))?;
         merge_mesh(&mut mesh, level_mesh)?;
 
         if options.flip_winding {
-            flip_face_winding(&mut mesh.faces[face_start..]);
+            flip_face_winding(&mut mesh.indices[index_start..]);
         }
     }
 
@@ -207,20 +197,14 @@ fn mesh_level_parallel(
     let mut chunks = chunk_aabbs
         .into_par_iter()
         .map(|active_aabb| {
-            let mut mesh = Mesh3D {
-                positions: Vec::new(),
-                faces: Vec::new(),
-            };
+            let mut mesh = Mesh3D::default();
             mc33::mesh_level_aabb(level, active_aabb, ranges, isovalue, &mut mesh)?;
             Ok((active_aabb, mesh))
         })
         .collect::<Result<Vec<_>>>()?;
     chunks.sort_by_key(|(aabb, _)| chunk_sort_key(*aabb));
 
-    let mut mesh = Mesh3D {
-        positions: Vec::new(),
-        faces: Vec::new(),
-    };
+    let mut mesh = Mesh3D::default();
     for (_, chunk_mesh) in chunks {
         merge_mesh(&mut mesh, chunk_mesh)?;
     }
@@ -230,15 +214,23 @@ fn mesh_level_parallel(
 fn merge_mesh(dest: &mut Mesh3D, src: Mesh3D) -> Result<()> {
     let base = u32::try_from(dest.positions.len()).context("mesh vertex count exceeds u32")?;
     ensure!(
-        src.faces.iter().all(|face| {
+        src.positions.len() == src.uv.len(),
+        "source mesh position and uv buffers have different lengths"
+    );
+    ensure!(
+        src.indices.iter().all(|face| {
             face.x <= u32::MAX - base && face.y <= u32::MAX - base && face.z <= u32::MAX - base
         }),
         "mesh face index exceeds u32 after merge"
     );
 
     dest.positions.extend(src.positions);
-    dest.faces
-        .extend(src.faces.into_iter().map(|face| face + UVec3::splat(base)));
+    dest.uv.extend(src.uv);
+    dest.indices.extend(
+        src.indices
+            .into_iter()
+            .map(|face| face + UVec3::splat(base)),
+    );
     Ok(())
 }
 

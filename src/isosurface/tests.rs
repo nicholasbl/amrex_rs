@@ -6,7 +6,7 @@ use super::sampling::sampled_values_on_edge;
 use super::*;
 use crate::sparse_amr::level_translation;
 use crate::utility::{Aabb3u, SparseGrid3};
-use glam::{DVec3, I64Vec3, IVec3, U16Vec2, UVec3};
+use glam::{DVec3, I64Vec3, IVec3, U16Vec2, UVec3, Vec3};
 
 fn level_with_grids<'a>(
     samples: &'a SparseGrid3<f32>,
@@ -136,10 +136,7 @@ fn mc33_extracts_a_plane_without_tetrahedral_diagonals() {
     active_cubes.set(UVec3::ZERO, ());
     let level = level_with_grids(&samples, Vec::new(), &active_cubes);
 
-    let mut mesh = Mesh3D {
-        positions: Vec::new(),
-        faces: Vec::new(),
-    };
+    let mut mesh = Mesh3D::default();
     mesh_level_mc33_aabb(
         &level,
         level.active_cubes.bounds_aabb(),
@@ -150,11 +147,17 @@ fn mc33_extracts_a_plane_without_tetrahedral_diagonals() {
     .unwrap();
 
     assert_eq!(mesh.positions.len(), 4);
-    assert_eq!(mesh.faces.len(), 2);
+    assert_eq!(mesh.uv.len(), 4);
+    assert_eq!(mesh.indices.len(), 2);
     assert!(
         mesh.positions
             .iter()
-            .all(|vertex| (vertex.position.x - 1.0).abs() < 1.0e-6)
+            .all(|position| (position.x - 1.0).abs() < 1.0e-6)
+    );
+    assert!(
+        mesh.indices
+            .iter()
+            .all(|&face| triangle_normal(&mesh.positions, face).dot(Vec3::X) < 0.0)
     );
 }
 
@@ -197,7 +200,7 @@ fn public_mesher_extracts_across_active_chunks() -> Result<()> {
     )?;
 
     ensure!(!mesh.positions.is_empty(), "expected extracted vertices");
-    ensure!(!mesh.faces.is_empty(), "expected extracted faces");
+    ensure!(!mesh.indices.is_empty(), "expected extracted faces");
     Ok(())
 }
 
@@ -220,7 +223,7 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
             },
         )?;
         ensure!(!mesh.positions.is_empty(), "expected extracted vertices");
-        ensure!(!mesh.faces.is_empty(), "expected extracted faces");
+        ensure!(!mesh.indices.is_empty(), "expected extracted faces");
 
         let compact = CompactPlot::load(&plotfile, &[0])?;
         let mesh = isosurface_compact(
@@ -236,7 +239,7 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
             !mesh.positions.is_empty(),
             "expected compact extracted vertices"
         );
-        ensure!(!mesh.faces.is_empty(), "expected compact extracted faces");
+        ensure!(!mesh.indices.is_empty(), "expected compact extracted faces");
 
         let mesh = isosurface_compact(
             &compact,
@@ -265,7 +268,10 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
             mesh.positions.is_empty(),
             "unexpected vertices from omitted level"
         );
-        ensure!(mesh.faces.is_empty(), "unexpected faces from omitted level");
+        ensure!(
+            mesh.indices.is_empty(),
+            "unexpected faces from omitted level"
+        );
         Ok(())
     })();
 
@@ -278,4 +284,76 @@ fn flip_face_winding_swaps_new_face_orientation() {
     let mut faces = [UVec3::new(1, 2, 3), UVec3::new(4, 5, 6)];
     flip_face_winding(&mut faces);
     assert_eq!(faces, [UVec3::new(1, 3, 2), UVec3::new(4, 6, 5)]);
+}
+
+#[test]
+fn public_mesher_flip_winding_inverts_lower_quantity_front_face() -> Result<()> {
+    let compact = single_plane_compact();
+    let mesh = isosurface_compact(
+        &compact,
+        IsosurfaceOptions {
+            surface: Surface { id: 0, value: 0.5 },
+            sampled_quantities: Vec::new(),
+            levels: None,
+            flip_winding: false,
+        },
+    )?;
+    ensure!(!mesh.indices.is_empty(), "expected extracted faces");
+    assert!(
+        mesh.indices
+            .iter()
+            .all(|&face| triangle_normal(&mesh.positions, face).dot(Vec3::X) < 0.0)
+    );
+
+    let flipped = isosurface_compact(
+        &compact,
+        IsosurfaceOptions {
+            surface: Surface { id: 0, value: 0.5 },
+            sampled_quantities: Vec::new(),
+            levels: None,
+            flip_winding: true,
+        },
+    )?;
+    assert_eq!(flipped.indices.len(), mesh.indices.len());
+    assert!(
+        flipped
+            .indices
+            .iter()
+            .all(|&face| triangle_normal(&flipped.positions, face).dot(Vec3::X) > 0.0)
+    );
+
+    Ok(())
+}
+
+fn single_plane_compact() -> CompactPlot {
+    let mut samples = SparseGrid3::new(UVec3::splat(2));
+    for z in 0..2 {
+        for y in 0..2 {
+            for x in 0..2 {
+                samples.set(UVec3::new(x, y, z), x as f32);
+            }
+        }
+    }
+    let mut active_cubes = SparseGrid3::new(UVec3::ONE);
+    active_cubes.set(UVec3::ZERO, ());
+    CompactPlot {
+        variable_count: 1,
+        refinement_ratios: Vec::new(),
+        component_ids: vec![0],
+        levels: vec![crate::compact::CompactLevel {
+            level_index: 0,
+            index_origin: IVec3::ZERO,
+            physical_origin: DVec3::ZERO,
+            cell_size: DVec3::ONE,
+            components: vec![samples],
+            eligible_cubes: active_cubes,
+        }],
+    }
+}
+
+fn triangle_normal(positions: &[Vec3], face: UVec3) -> Vec3 {
+    let a = positions[face.x as usize];
+    let b = positions[face.y as usize];
+    let c = positions[face.z as usize];
+    (b - a).cross(c - a)
 }

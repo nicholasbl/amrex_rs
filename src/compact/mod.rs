@@ -606,7 +606,7 @@ mod tests {
                 },
             )?;
             ensure!(!mesh.positions.is_empty(), "expected extracted vertices");
-            ensure!(!mesh.faces.is_empty(), "expected extracted faces");
+            ensure!(!mesh.indices.is_empty(), "expected extracted faces");
             Ok(())
         })();
 
