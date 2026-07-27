@@ -8,6 +8,7 @@ mod dual_grid;
 mod mc33;
 mod sampling;
 
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
 use anyhow::{Context, Result, ensure};
@@ -59,6 +60,252 @@ pub struct Mesh3D {
     pub uv: Vec<[f32; 2]>,
     /// Triangle vertex indices.
     pub indices: Vec<[u32; 3]>,
+}
+
+/// Thresholds used when merging duplicate mesh vertices.
+#[derive(Debug, Clone, Copy)]
+pub struct DedupMeshOptions {
+    /// Maximum Euclidean distance between positions for vertices to merge.
+    pub position_epsilon: f32,
+    /// Maximum Euclidean distance between UVs for vertices to merge.
+    ///
+    /// This is ignored when `mesh.uv` is empty.
+    pub uv_epsilon: f32,
+}
+
+/// Options controlling removal of degenerate triangles.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoveDegenerateTrianglesOptions {
+    /// Minimum triangle area to keep.
+    ///
+    /// Triangles with repeated indices are always removed. Triangles with area
+    /// less than or equal to this threshold are removed after validating their
+    /// indices and positions.
+    pub area_epsilon: f32,
+}
+
+/// Merge vertices whose positions and UVs are within the configured thresholds.
+///
+/// The operation is in-place and returns the number of removed vertices. Meshes
+/// with an empty UV buffer are deduplicated by position only. Meshes with a
+/// non-empty UV buffer must have one UV per position.
+pub fn dedup_mesh_vertices(mesh: &mut Mesh3D, options: DedupMeshOptions) -> Result<usize> {
+    ensure!(
+        options.position_epsilon.is_finite() && options.position_epsilon > 0.0,
+        "position_epsilon must be finite and positive"
+    );
+    ensure!(
+        options.uv_epsilon.is_finite() && options.uv_epsilon > 0.0,
+        "uv_epsilon must be finite and positive"
+    );
+    ensure!(
+        mesh.uv.is_empty() || mesh.uv.len() == mesh.positions.len(),
+        "mesh uv buffer must be empty or match position count"
+    );
+
+    if mesh.positions.is_empty() {
+        return Ok(0);
+    }
+
+    let use_uv = !mesh.uv.is_empty();
+    let mut remap = vec![0u32; mesh.positions.len()];
+    let mut positions = Vec::with_capacity(mesh.positions.len());
+    let mut uv = Vec::with_capacity(mesh.uv.len());
+    let mut buckets: HashMap<[i64; 5], Vec<u32>> = HashMap::new();
+    let position_epsilon_squared = options.position_epsilon * options.position_epsilon;
+    let uv_epsilon_squared = options.uv_epsilon * options.uv_epsilon;
+
+    for (old_index, &position) in mesh.positions.iter().enumerate() {
+        let old_uv = use_uv.then(|| mesh.uv[old_index]);
+        ensure!(
+            position.iter().all(|component| component.is_finite()),
+            "mesh position {old_index} contains a non-finite component"
+        );
+        ensure!(
+            old_uv.is_none_or(|uv| uv.iter().all(|component| component.is_finite())),
+            "mesh uv {old_index} contains a non-finite component"
+        );
+        let key = dedup_bucket_key(position, old_uv, options);
+        let mut merged = None;
+
+        visit_neighboring_dedup_keys(key, use_uv, |neighbor_key| {
+            let Some(candidates) = buckets.get(&neighbor_key) else {
+                return true;
+            };
+            for &candidate in candidates {
+                let candidate_index = candidate as usize;
+                if position_distance_squared(position, positions[candidate_index])
+                    <= position_epsilon_squared
+                    && (!use_uv
+                        || uv_distance_squared(old_uv.unwrap(), uv[candidate_index])
+                            <= uv_epsilon_squared)
+                {
+                    merged = Some(candidate);
+                    return false;
+                }
+            }
+            true
+        });
+
+        let new_index = match merged {
+            Some(index) => index,
+            None => {
+                let index =
+                    u32::try_from(positions.len()).context("mesh vertex count exceeds u32")?;
+                positions.push(position);
+                if let Some(uv_value) = old_uv {
+                    uv.push(uv_value);
+                }
+                buckets.entry(key).or_default().push(index);
+                index
+            }
+        };
+        remap[old_index] = new_index;
+    }
+
+    mesh.indices
+        .par_iter_mut()
+        .try_for_each(|face| -> Result<()> {
+            for index in face {
+                let old_index =
+                    usize::try_from(*index).context("mesh index does not fit in usize")?;
+                *index = *remap
+                    .get(old_index)
+                    .with_context(|| format!("mesh index {old_index} is out of bounds"))?;
+            }
+            Ok(())
+        })?;
+
+    let removed = mesh.positions.len() - positions.len();
+    mesh.positions = positions;
+    mesh.uv = uv;
+    Ok(removed)
+}
+
+/// Remove triangles with repeated indices or near-zero physical area.
+///
+/// The operation is in-place and returns the number of removed triangles.
+pub fn remove_degenerate_triangles(
+    mesh: &mut Mesh3D,
+    options: RemoveDegenerateTrianglesOptions,
+) -> Result<usize> {
+    ensure!(
+        options.area_epsilon.is_finite() && options.area_epsilon >= 0.0,
+        "area_epsilon must be finite and non-negative"
+    );
+
+    let area_epsilon_squared = options.area_epsilon * options.area_epsilon;
+    let mut kept = Vec::with_capacity(mesh.indices.len());
+    for (face_index, &face) in mesh.indices.iter().enumerate() {
+        if has_repeated_index(face) {
+            continue;
+        }
+
+        let a = position_for_face_vertex(mesh, face_index, face[0])?;
+        let b = position_for_face_vertex(mesh, face_index, face[1])?;
+        let c = position_for_face_vertex(mesh, face_index, face[2])?;
+        if triangle_area_squared(a, b, c) <= area_epsilon_squared {
+            continue;
+        }
+        kept.push(face);
+    }
+
+    let removed = mesh.indices.len() - kept.len();
+    mesh.indices = kept;
+    Ok(removed)
+}
+
+fn dedup_bucket_key(
+    position: [f32; 3],
+    uv: Option<[f32; 2]>,
+    options: DedupMeshOptions,
+) -> [i64; 5] {
+    let uv = uv.unwrap_or([0.0, 0.0]);
+    [
+        bucket_coord(position[0], options.position_epsilon),
+        bucket_coord(position[1], options.position_epsilon),
+        bucket_coord(position[2], options.position_epsilon),
+        bucket_coord(uv[0], options.uv_epsilon),
+        bucket_coord(uv[1], options.uv_epsilon),
+    ]
+}
+
+fn bucket_coord(value: f32, epsilon: f32) -> i64 {
+    (value / epsilon).floor() as i64
+}
+
+fn visit_neighboring_dedup_keys<F>(key: [i64; 5], use_uv: bool, mut visitor: F)
+where
+    F: FnMut([i64; 5]) -> bool,
+{
+    for dz in -1..=1 {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if use_uv {
+                    for dv in -1..=1 {
+                        for du in -1..=1 {
+                            if !visitor([
+                                key[0] + dx,
+                                key[1] + dy,
+                                key[2] + dz,
+                                key[3] + du,
+                                key[4] + dv,
+                            ]) {
+                                return;
+                            }
+                        }
+                    }
+                } else if !visitor([key[0] + dx, key[1] + dy, key[2] + dz, key[3], key[4]]) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn position_distance_squared(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx.mul_add(dx, dy.mul_add(dy, dz * dz))
+}
+
+fn uv_distance_squared(a: [f32; 2], b: [f32; 2]) -> f32 {
+    let du = a[0] - b[0];
+    let dv = a[1] - b[1];
+    du.mul_add(du, dv * dv)
+}
+
+fn has_repeated_index(face: [u32; 3]) -> bool {
+    face[0] == face[1] || face[0] == face[2] || face[1] == face[2]
+}
+
+fn position_for_face_vertex(
+    mesh: &Mesh3D,
+    face_index: usize,
+    vertex_index: u32,
+) -> Result<[f32; 3]> {
+    let vertex_index = usize::try_from(vertex_index).context("mesh index does not fit in usize")?;
+    let position = *mesh
+        .positions
+        .get(vertex_index)
+        .with_context(|| format!("mesh face {face_index} index {vertex_index} is out of bounds"))?;
+    ensure!(
+        position.iter().all(|component| component.is_finite()),
+        "mesh face {face_index} references a non-finite position"
+    );
+    Ok(position)
+}
+
+fn triangle_area_squared(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let cross = [
+        ab[1].mul_add(ac[2], -ab[2] * ac[1]),
+        ab[2].mul_add(ac[0], -ab[0] * ac[2]),
+        ab[0].mul_add(ac[1], -ab[1] * ac[0]),
+    ];
+    0.25 * position_distance_squared(cross, [0.0, 0.0, 0.0])
 }
 
 #[derive(Debug, Clone, Copy)]

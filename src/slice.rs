@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
 use anyhow::{Context, Result, ensure};
-use glam::{DVec3, IVec3, UVec3};
+use glam::{DVec3, I64Vec3, IVec3, UVec3};
 
 use crate::PlotFile;
 use crate::compact::CompactPlot;
@@ -57,7 +57,7 @@ struct SliceLevel<'a> {
     physical_origin: DVec3,
     cell_size: DVec3,
     sampled_quantities: Vec<&'a SparseGrid3<f32>>,
-    active_cubes: SparseGrid3<()>,
+    active_cells: SparseGrid3<()>,
 }
 
 /// Load required data from a plotfile and extract an axis-aligned slice mesh.
@@ -88,8 +88,12 @@ pub fn slice_compact(compact_plot: &CompactPlot, options: SliceOptions) -> Resul
         .iter()
         .map(|sample| sample.range)
         .collect::<Vec<_>>();
-    let levels =
-        slice_levels_from_compact(compact_plot, &sampled_components, options.levels.as_ref())?;
+    let levels = slice_levels_from_compact(
+        compact_plot,
+        &sampled_components,
+        options.plane,
+        options.levels.as_ref(),
+    )?;
 
     let mut mesh = Mesh3D::default();
     for level in &levels {
@@ -140,6 +144,7 @@ fn validate_slice_options(variable_count: usize, samples: &[Sample]) -> Result<V
 fn slice_levels_from_compact<'a>(
     compact_plot: &'a CompactPlot,
     sampled_components: &[usize],
+    plane: SlicePlane,
     level_range: Option<&RangeInclusive<usize>>,
 ) -> Result<Vec<SliceLevel<'a>>> {
     let sampled_slots = sampled_components
@@ -157,6 +162,17 @@ fn slice_levels_from_compact<'a>(
             continue;
         }
 
+        let sampled_quantities = sampled_slots
+            .iter()
+            .map(|&slot| {
+                compact_level
+                    .components
+                    .get(slot)
+                    .context("sample component slot is absent from compact level")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let active_cells = build_slice_active_cells(sampled_quantities[0], compact_level, plane)?;
+
         if let Some(coarse) = levels.last_mut() {
             let ratio = compact_plot
                 .refinement_ratios
@@ -167,13 +183,13 @@ fn slice_levels_from_compact<'a>(
 
             let translation =
                 level_translation(coarse.index_origin, compact_level.index_origin, ratio)?;
-            let fine_coverage = compact_level
-                .components
-                .get(sampled_slots[0])
-                .context("sample component slot is absent from compact level")?;
-            coarse
-                .active_cubes
-                .mask_out_by_presence_scaled(fine_coverage, ratio, translation);
+            mask_out_fully_refined_slice_cells(
+                &mut coarse.active_cells,
+                &active_cells,
+                ratio,
+                translation,
+                plane.axis,
+            );
         }
 
         levels.push(SliceLevel {
@@ -181,28 +197,39 @@ fn slice_levels_from_compact<'a>(
             index_origin: compact_level.index_origin,
             physical_origin: compact_level.physical_origin,
             cell_size: compact_level.cell_size,
-            sampled_quantities: sampled_slots
-                .iter()
-                .map(|&slot| {
-                    compact_level
-                        .components
-                        .get(slot)
-                        .context("sample component slot is absent from compact level")
-                })
-                .collect::<Result<Vec<_>>>()?,
-            active_cubes: compact_level.eligible_cubes.clone(),
+            sampled_quantities,
+            active_cells,
         });
     }
 
     Ok(levels)
 }
 
-fn mesh_level(level: &SliceLevel<'_>, plane: SlicePlane, ranges: &[SampleRange]) -> Result<Mesh3D> {
-    let axis = axis_index(plane.axis);
-    let Some((anchor_axis, t)) = plane_anchor_and_t(level, plane)? else {
-        return Ok(Mesh3D::default());
+fn build_slice_active_cells(
+    samples: &SparseGrid3<f32>,
+    level: &crate::compact::CompactLevel,
+    plane: SlicePlane,
+) -> Result<SparseGrid3<()>> {
+    let Some(axis_cell) = plane_cell(
+        level.physical_origin,
+        level.cell_size,
+        samples.bounds(),
+        plane,
+    )?
+    else {
+        return Ok(SparseGrid3::new(samples.bounds()));
     };
+    let axis = axis_index(plane.axis);
+    let mut active = SparseGrid3::with_chunk_capacity(samples.bounds(), samples.chunk_count());
+    samples.for_each_present_in_aabb(samples.bounds_aabb(), |cell, _| {
+        if component(cell, axis) == axis_cell {
+            active.set(cell, ());
+        }
+    });
+    Ok(active)
+}
 
+fn mesh_level(level: &SliceLevel<'_>, plane: SlicePlane, ranges: &[SampleRange]) -> Result<Mesh3D> {
     let mut mesh = Mesh3D::default();
     let mut vertex_ids = HashMap::new();
     let mut accessors = level
@@ -213,9 +240,9 @@ fn mesh_level(level: &SliceLevel<'_>, plane: SlicePlane, ranges: &[SampleRange])
 
     let mut error = None;
     level
-        .active_cubes
-        .for_each_present_in_aabb(level.active_cubes.bounds_aabb(), |anchor, ()| {
-            if error.is_none() && component(anchor, axis) == anchor_axis {
+        .active_cells
+        .for_each_present_in_aabb(level.active_cells.bounds_aabb(), |cell, ()| {
+            if error.is_none() {
                 error = emit_quad(
                     &mut mesh,
                     &mut vertex_ids,
@@ -223,8 +250,7 @@ fn mesh_level(level: &SliceLevel<'_>, plane: SlicePlane, ranges: &[SampleRange])
                     ranges,
                     level,
                     plane,
-                    anchor,
-                    t,
+                    cell,
                 )
                 .err();
             }
@@ -236,58 +262,57 @@ fn mesh_level(level: &SliceLevel<'_>, plane: SlicePlane, ranges: &[SampleRange])
     }
 }
 
-fn plane_anchor_and_t(level: &SliceLevel<'_>, plane: SlicePlane) -> Result<Option<(u32, f32)>> {
+fn plane_cell(
+    physical_origin: DVec3,
+    cell_size: DVec3,
+    bounds: UVec3,
+    plane: SlicePlane,
+) -> Result<Option<u32>> {
     let axis = axis_index(plane.axis);
-    let bounds = level.active_cubes.bounds();
     if component(bounds, axis) == 0 {
         return Ok(None);
     }
 
-    let grid_position = (plane.value - component_d(level.physical_origin, axis))
-        / component_d(level.cell_size, axis)
-        - 0.5;
+    let grid_position =
+        (plane.value - component_d(physical_origin, axis)) / component_d(cell_size, axis);
     if !grid_position.is_finite() {
         return Ok(None);
     }
 
     let lower = grid_position.floor();
     let mut anchor = lower as i64;
-    let mut t = grid_position - lower;
-    if t == 0.0 && anchor > 0 {
+    if grid_position == lower && anchor > 0 {
         anchor -= 1;
-        t = 1.0;
     }
     if anchor < 0 || anchor >= i64::from(component(bounds, axis)) {
         return Ok(None);
     }
-    Ok(Some((
-        u32::try_from(anchor).context("slice anchor does not fit in u32")?,
-        t as f32,
-    )))
+    Ok(Some(
+        u32::try_from(anchor).context("slice cell index does not fit in u32")?,
+    ))
 }
 
 fn emit_quad(
     mesh: &mut Mesh3D,
-    vertex_ids: &mut HashMap<UVec3, u32>,
+    vertex_ids: &mut HashMap<(UVec3, UVec3), u32>,
     accessors: &mut [GridAccessor<'_, f32>],
     ranges: &[SampleRange],
     level: &SliceLevel<'_>,
     plane: SlicePlane,
-    anchor: UVec3,
-    t: f32,
+    cell: UVec3,
 ) -> Result<()> {
-    let corners = quad_corners(plane.axis, anchor);
+    let corners = quad_corners(plane.axis, cell);
     let a = vertex(
-        mesh, vertex_ids, accessors, ranges, level, plane, corners[0], t,
+        mesh, vertex_ids, accessors, ranges, level, plane, cell, corners[0],
     )?;
     let b = vertex(
-        mesh, vertex_ids, accessors, ranges, level, plane, corners[1], t,
+        mesh, vertex_ids, accessors, ranges, level, plane, cell, corners[1],
     )?;
     let c = vertex(
-        mesh, vertex_ids, accessors, ranges, level, plane, corners[2], t,
+        mesh, vertex_ids, accessors, ranges, level, plane, cell, corners[2],
     )?;
     let d = vertex(
-        mesh, vertex_ids, accessors, ranges, level, plane, corners[3], t,
+        mesh, vertex_ids, accessors, ranges, level, plane, cell, corners[3],
     )?;
     mesh.indices.push([a, b, c]);
     mesh.indices.push([a, c, d]);
@@ -296,49 +321,68 @@ fn emit_quad(
 
 fn vertex(
     mesh: &mut Mesh3D,
-    vertex_ids: &mut HashMap<UVec3, u32>,
+    vertex_ids: &mut HashMap<(UVec3, UVec3), u32>,
     accessors: &mut [GridAccessor<'_, f32>],
     ranges: &[SampleRange],
     level: &SliceLevel<'_>,
     plane: SlicePlane,
+    cell: UVec3,
     key: UVec3,
-    t: f32,
 ) -> Result<u32> {
-    if let Some(&id) = vertex_ids.get(&key) {
+    let vertex_key = (cell, key);
+    if let Some(&id) = vertex_ids.get(&vertex_key) {
         return Ok(id);
     }
 
     let position = physical_position(level, plane, key);
-    let uv = sample_uv(accessors, ranges, plane.axis, key, t)?;
+    let uv = sample_uv(accessors, ranges, level, plane, cell)?;
     let id = u32::try_from(mesh.positions.len()).context("mesh vertex count exceeds u32")?;
     mesh.positions.push(position);
     mesh.uv.push(uv);
-    vertex_ids.insert(key, id);
+    vertex_ids.insert(vertex_key, id);
     Ok(id)
 }
 
 fn sample_uv(
     accessors: &mut [GridAccessor<'_, f32>],
     ranges: &[SampleRange],
-    axis: SliceAxis,
-    key: UVec3,
-    t: f32,
+    level: &SliceLevel<'_>,
+    plane: SlicePlane,
+    cell: UVec3,
 ) -> Result<[f32; 2]> {
     ensure!(
         accessors.len() == ranges.len(),
         "sample grid and range counts differ"
     );
     let mut uv = [0.0; 2];
-    let lower = key;
-    let upper = add_axis(key, axis, 1)?;
+    let axis = axis_index(plane.axis);
+    let center_position = component_d(level.physical_origin, axis)
+        + (f64::from(component(cell, axis)) + 0.5) * component_d(level.cell_size, axis);
+    let neighbor = if plane.value >= center_position {
+        add_axis(cell, plane.axis, 1).ok()
+    } else {
+        sub_axis(cell, plane.axis, 1)
+    };
+
     for (channel, (accessor, range)) in accessors.iter_mut().zip(ranges).enumerate() {
-        let a = accessor
-            .get(lower)
-            .with_context(|| format!("slice sample is absent at {lower:?}"))?;
-        let b = accessor
-            .get(upper)
-            .with_context(|| format!("slice sample is absent at {upper:?}"))?;
-        uv[channel] = normalize_sample((b - a).mul_add(t, a), *range);
+        let value =
+            match neighbor.and_then(|neighbor| accessor.get(neighbor).map(|b| (neighbor, b))) {
+                Some((neighbor, b)) => {
+                    let a = accessor
+                        .get(cell)
+                        .with_context(|| format!("slice sample is absent at {cell:?}"))?;
+                    let neighbor_center = component_d(level.physical_origin, axis)
+                        + (f64::from(component(neighbor, axis)) + 0.5)
+                            * component_d(level.cell_size, axis);
+                    let t = ((plane.value - center_position) / (neighbor_center - center_position))
+                        .clamp(0.0, 1.0) as f32;
+                    (b - a).mul_add(t, a)
+                }
+                None => accessor
+                    .get(cell)
+                    .with_context(|| format!("slice sample is absent at {cell:?}"))?,
+            };
+        uv[channel] = normalize_sample(value, *range);
     }
     Ok(uv)
 }
@@ -348,8 +392,7 @@ fn normalize_sample(value: f32, range: SampleRange) -> f32 {
 }
 
 fn physical_position(level: &SliceLevel<'_>, plane: SlicePlane, key: UVec3) -> [f32; 3] {
-    let mut position = (level.physical_origin
-        + (key.as_dvec3() + DVec3::splat(0.5)) * level.cell_size)
+    let mut position = (level.physical_origin + key.as_dvec3() * level.cell_size)
         .as_vec3()
         .to_array();
     position[axis_index(plane.axis)] = plane.value as f32;
@@ -386,6 +429,89 @@ fn add_axis(mut p: UVec3, axis: SliceAxis, amount: u32) -> Result<UVec3> {
         SliceAxis::Z => p.z = p.z.checked_add(amount).context("z coordinate overflow")?,
     }
     Ok(p)
+}
+
+fn sub_axis(mut p: UVec3, axis: SliceAxis, amount: u32) -> Option<UVec3> {
+    match axis {
+        SliceAxis::X => p.x = p.x.checked_sub(amount)?,
+        SliceAxis::Y => p.y = p.y.checked_sub(amount)?,
+        SliceAxis::Z => p.z = p.z.checked_sub(amount)?,
+    }
+    Some(p)
+}
+
+fn mask_out_fully_refined_slice_cells(
+    coarse: &mut SparseGrid3<()>,
+    fine: &SparseGrid3<()>,
+    scale: u32,
+    translation: I64Vec3,
+    axis: SliceAxis,
+) {
+    if scale == 0 || coarse.is_empty() || fine.is_empty() {
+        return;
+    }
+
+    let mut covered = Vec::new();
+    coarse.for_each_present_in_aabb(coarse.bounds_aabb(), |cell, ()| {
+        if fine_fully_covers_projected_cell(cell, fine, scale, translation, axis) {
+            covered.push(cell);
+        }
+    });
+    for cell in covered {
+        coarse.clear(cell);
+    }
+}
+
+fn fine_fully_covers_projected_cell(
+    coarse_cell: UVec3,
+    fine: &SparseGrid3<()>,
+    scale: u32,
+    translation: I64Vec3,
+    axis: SliceAxis,
+) -> bool {
+    let axis_index = axis_index(axis);
+    let min = coarse_cell.as_i64vec3() * i64::from(scale) + translation;
+    let max = (coarse_cell.as_i64vec3() + I64Vec3::ONE) * i64::from(scale) + translation;
+    if min.cmpge(max).any() {
+        return false;
+    }
+
+    let fine_bounds = fine.bounds().as_i64vec3();
+    if min.cmplt(I64Vec3::ZERO).any() || max.cmpgt(fine_bounds).any() {
+        return false;
+    }
+
+    let orthogonal_axes = match axis {
+        SliceAxis::X => [1, 2],
+        SliceAxis::Y => [0, 2],
+        SliceAxis::Z => [0, 1],
+    };
+    let mut a = min[orthogonal_axes[0]];
+    while a < max[orthogonal_axes[0]] {
+        let mut b = min[orthogonal_axes[1]];
+        while b < max[orthogonal_axes[1]] {
+            let mut found = false;
+            let mut p = min;
+            p[orthogonal_axes[0]] = a;
+            p[orthogonal_axes[1]] = b;
+            let mut c = min[axis_index];
+            while c < max[axis_index] {
+                p[axis_index] = c;
+                let p = UVec3::new(p.x as u32, p.y as u32, p.z as u32);
+                if fine.contains(p) {
+                    found = true;
+                    break;
+                }
+                c += 1;
+            }
+            if !found {
+                return false;
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    true
 }
 
 fn component(v: UVec3, axis: usize) -> u32 {
@@ -472,6 +598,24 @@ mod tests {
         }
     }
 
+    fn compact_for_single_cell() -> CompactPlot {
+        let mut u = SparseGrid3::new(UVec3::ONE);
+        u.set(UVec3::ZERO, 2.0);
+        CompactPlot {
+            variable_count: 1,
+            refinement_ratios: Vec::new(),
+            component_ids: vec![0],
+            levels: vec![CompactLevel {
+                level_index: 0,
+                index_origin: IVec3::ZERO,
+                physical_origin: DVec3::ZERO,
+                cell_size: DVec3::ONE,
+                components: vec![u],
+                eligible_cubes: SparseGrid3::new(UVec3::ZERO),
+            }],
+        }
+    }
+
     #[test]
     fn x_slice_places_geometry_at_exact_plane_and_interpolates_uvs() -> Result<()> {
         let compact = compact_for_linear_field();
@@ -497,12 +641,38 @@ mod tests {
             },
         )?;
 
-        assert_eq!(mesh.indices.len(), 8);
-        assert_eq!(mesh.positions.len(), 9);
+        assert_eq!(mesh.indices.len(), 18);
+        assert_eq!(mesh.positions.len(), 36);
         assert!(mesh.positions.iter().all(|p| (p[0] - 1.25).abs() < 1.0e-6));
         let min_u = mesh.uv.iter().map(|uv| uv[0]).fold(f32::INFINITY, f32::min);
         assert!((min_u - 0.375).abs() < 1.0e-6);
         assert!(mesh.uv.iter().all(|uv| (0.0..=1.0).contains(&uv[1])));
+        Ok(())
+    }
+
+    #[test]
+    fn slice_emits_cell_when_interpolation_neighbor_is_absent() -> Result<()> {
+        let compact = compact_for_single_cell();
+        let mesh = slice_compact(
+            &compact,
+            SliceOptions {
+                plane: SlicePlane {
+                    axis: SliceAxis::X,
+                    value: 0.25,
+                },
+                sampled_quantities: vec![Sample {
+                    id: 0,
+                    range: 0.0..=4.0,
+                }],
+                levels: None,
+                flip_winding: false,
+            },
+        )?;
+
+        assert_eq!(mesh.indices.len(), 2);
+        assert_eq!(mesh.positions.len(), 4);
+        assert!(mesh.positions.iter().all(|p| (p[0] - 0.25).abs() < 1.0e-6));
+        assert!(mesh.uv.iter().all(|uv| (uv[0] - 0.5).abs() < 1.0e-6));
         Ok(())
     }
 

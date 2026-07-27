@@ -12,7 +12,10 @@ pub(crate) mod sparse_amr;
 pub mod utility;
 
 pub use compact::{CompactOptions, CompactPlot, read_compact, write_compact};
-pub use isosurface::{IsosurfaceOptions, Mesh3D, Sample, Surface, isosurface, isosurface_compact};
+pub use isosurface::{
+    DedupMeshOptions, IsosurfaceOptions, Mesh3D, RemoveDegenerateTrianglesOptions, Sample, Surface,
+    dedup_mesh_vertices, isosurface, isosurface_compact, remove_degenerate_triangles,
+};
 pub use slice::{SliceAxis, SliceOptions, SlicePlane, slice, slice_compact};
 
 pub use input::{

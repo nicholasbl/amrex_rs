@@ -325,6 +325,136 @@ fn public_mesher_flip_winding_inverts_lower_quantity_front_face() -> Result<()> 
     Ok(())
 }
 
+#[test]
+fn dedup_mesh_vertices_merges_by_position_and_uv_thresholds() -> Result<()> {
+    let mut mesh = Mesh3D {
+        positions: vec![
+            [0.0, 0.0, 0.0],
+            [0.0005, 0.0, 0.0],
+            [0.0005, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+        uv: vec![[0.25, 0.5], [0.2504, 0.5], [0.9, 0.5], [1.0, 0.0]],
+        indices: vec![[0, 1, 3], [0, 2, 3]],
+    };
+
+    let removed = dedup_mesh_vertices(
+        &mut mesh,
+        DedupMeshOptions {
+            position_epsilon: 0.001,
+            uv_epsilon: 0.001,
+        },
+    )?;
+
+    assert_eq!(removed, 1);
+    assert_eq!(mesh.positions.len(), 3);
+    assert_eq!(mesh.uv.len(), 3);
+    assert_eq!(mesh.indices, vec![[0, 0, 2], [0, 1, 2]]);
+    Ok(())
+}
+
+#[test]
+fn dedup_mesh_vertices_supports_position_only_meshes() -> Result<()> {
+    let mut mesh = Mesh3D {
+        positions: vec![[0.0, 0.0, 0.0], [0.0005, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        uv: Vec::new(),
+        indices: vec![[0, 1, 2]],
+    };
+
+    let removed = dedup_mesh_vertices(
+        &mut mesh,
+        DedupMeshOptions {
+            position_epsilon: 0.001,
+            uv_epsilon: 0.001,
+        },
+    )?;
+
+    assert_eq!(removed, 1);
+    assert!(mesh.uv.is_empty());
+    assert_eq!(mesh.indices, vec![[0, 0, 1]]);
+    Ok(())
+}
+
+#[test]
+fn dedup_mesh_vertices_rejects_partial_uv_buffer() {
+    let mut mesh = Mesh3D {
+        positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        uv: vec![[0.0, 0.0]],
+        indices: Vec::new(),
+    };
+
+    assert!(
+        dedup_mesh_vertices(
+            &mut mesh,
+            DedupMeshOptions {
+                position_epsilon: 0.001,
+                uv_epsilon: 0.001,
+            },
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn remove_degenerate_triangles_drops_repeated_indices_and_tiny_faces() -> Result<()> {
+    let mut mesh = Mesh3D {
+        positions: vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0001, 0.0, 0.0],
+        ],
+        uv: Vec::new(),
+        indices: vec![[0, 1, 2], [0, 0, 2], [0, 3, 1]],
+    };
+
+    let removed = remove_degenerate_triangles(
+        &mut mesh,
+        RemoveDegenerateTrianglesOptions {
+            area_epsilon: 0.001,
+        },
+    )?;
+
+    assert_eq!(removed, 2);
+    assert_eq!(mesh.indices, vec![[0, 1, 2]]);
+    Ok(())
+}
+
+#[test]
+fn remove_degenerate_triangles_keeps_exact_nonzero_area_when_threshold_is_zero() -> Result<()> {
+    let mut mesh = Mesh3D {
+        positions: vec![[0.0, 0.0, 0.0], [0.0001, 0.0, 0.0], [0.0, 0.0001, 0.0]],
+        uv: Vec::new(),
+        indices: vec![[0, 1, 2]],
+    };
+
+    let removed = remove_degenerate_triangles(
+        &mut mesh,
+        RemoveDegenerateTrianglesOptions { area_epsilon: 0.0 },
+    )?;
+
+    assert_eq!(removed, 0);
+    assert_eq!(mesh.indices, vec![[0, 1, 2]]);
+    Ok(())
+}
+
+#[test]
+fn remove_degenerate_triangles_rejects_out_of_bounds_indices() {
+    let mut mesh = Mesh3D {
+        positions: vec![[0.0, 0.0, 0.0]],
+        uv: Vec::new(),
+        indices: vec![[0, 1, 2]],
+    };
+
+    assert!(
+        remove_degenerate_triangles(
+            &mut mesh,
+            RemoveDegenerateTrianglesOptions { area_epsilon: 0.0 },
+        )
+        .is_err()
+    );
+}
+
 fn single_plane_compact() -> CompactPlot {
     let mut samples = SparseGrid3::new(UVec3::splat(2));
     for z in 0..2 {
