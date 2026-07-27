@@ -232,12 +232,11 @@ impl Mc33Mesher<'_> {
     }
 }
 
-fn sampled_values_to_uv(sampled_values: U16Vec2) -> [f32; 3] {
+fn sampled_values_to_uv(sampled_values: U16Vec2) -> [f32; 2] {
     let scale = 1.0 / f32::from(u16::MAX);
     [
         f32::from(sampled_values.x) * scale,
         f32::from(sampled_values.y) * scale,
-        0.0,
     ]
 }
 

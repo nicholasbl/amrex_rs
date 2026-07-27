@@ -56,7 +56,7 @@ pub struct Mesh3D {
     /// Physical-space vertex positions.
     pub positions: Vec<[f32; 3]>,
     /// Per-vertex texture coordinates. Indices match `positions`.
-    pub uv: Vec<[f32; 3]>,
+    pub uv: Vec<[f32; 2]>,
     /// Triangle vertex indices.
     pub indices: Vec<[u32; 3]>,
 }

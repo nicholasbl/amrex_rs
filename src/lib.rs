@@ -7,11 +7,13 @@
 pub mod compact;
 mod input;
 pub mod isosurface;
+pub mod slice;
 pub(crate) mod sparse_amr;
 pub mod utility;
 
 pub use compact::{CompactOptions, CompactPlot, read_compact, write_compact};
 pub use isosurface::{IsosurfaceOptions, Mesh3D, Sample, Surface, isosurface, isosurface_compact};
+pub use slice::{SliceAxis, SliceOptions, SlicePlane, slice, slice_compact};
 
 pub use input::{
     BoundingBox, BoxInfo, ByteOrder, CellHeader, ComponentBounds, ComponentView, CoordinateSystem,
