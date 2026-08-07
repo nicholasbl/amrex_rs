@@ -136,6 +136,8 @@ struct ArchiveMaskChunk {
 /// A `CompactPlot` stores selected components as sparse grids per AMR level and
 /// precomputes dual-cell eligibility used by isosurface extraction.
 pub struct CompactPlot {
+    pub(crate) simulation_time: f64,
+    pub(crate) variables: Vec<Variable>,
     pub(crate) variable_count: usize,
     pub(crate) refinement_ratios: Vec<usize>,
     pub(crate) component_ids: Vec<usize>,
@@ -195,11 +197,30 @@ impl CompactPlot {
         }
 
         Ok(Self {
+            simulation_time: plot_file.header().simulation_time,
+            variables: plot_file
+                .variables()
+                .iter()
+                .map(|variable| Variable {
+                    name: variable.name.clone(),
+                    index: variable.index,
+                })
+                .collect(),
             variable_count: plot_file.variables().len(),
             refinement_ratios: plot_file.header().refinement_ratios.clone(),
             component_ids: component_ids.to_vec(),
             levels,
         })
+    }
+
+    /// Simulation time from the original plotfile header.
+    pub fn simulation_time(&self) -> f64 {
+        self.simulation_time
+    }
+
+    /// Variables from the original plotfile header.
+    pub fn variables(&self) -> &[Variable] {
+        &self.variables
     }
 
     /// Number of variables in the original plotfile.
@@ -246,7 +267,13 @@ impl CompactArchive {
             "unsupported compact chunk size"
         );
 
-        let variable_count = self.header.variables.len();
+        let variables = self
+            .header
+            .variables
+            .into_iter()
+            .map(Variable::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        let variable_count = variables.len();
         let component_ids = self
             .component_ids
             .into_iter()
@@ -267,6 +294,8 @@ impl CompactArchive {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(CompactPlot {
+            simulation_time: self.header.simulation_time,
+            variables,
             variable_count,
             refinement_ratios: self
                 .header
@@ -321,6 +350,18 @@ impl ArchiveVariable {
             name: variable.name.clone(),
             index: variable.index as u64,
         }
+    }
+}
+
+impl TryFrom<ArchiveVariable> for Variable {
+    type Error = anyhow::Error;
+
+    fn try_from(variable: ArchiveVariable) -> Result<Self> {
+        Ok(Self {
+            name: variable.name,
+            index: usize::try_from(variable.index)
+                .context("variable index does not fit in usize")?,
+        })
     }
 }
 
@@ -596,6 +637,24 @@ mod tests {
             ensure!(!bytes.is_empty(), "compact archive is empty");
 
             let compact = read_compact(&bytes)?;
+            ensure!(
+                compact.simulation_time() == plotfile.header().simulation_time,
+                "compact archive did not preserve simulation time"
+            );
+            ensure!(
+                compact.variables().len() == plotfile.variables().len(),
+                "compact archive did not preserve variable count"
+            );
+            for (actual, expected) in compact.variables().iter().zip(plotfile.variables()) {
+                ensure!(
+                    actual.name == expected.name,
+                    "compact archive changed variable name"
+                );
+                ensure!(
+                    actual.index == expected.index,
+                    "compact archive changed variable index"
+                );
+            }
             let mesh = crate::isosurface_compact(
                 &compact,
                 crate::IsosurfaceOptions {

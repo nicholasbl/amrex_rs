@@ -176,6 +176,8 @@ fn public_mesher_extracts_across_active_chunks() -> Result<()> {
     active_cubes.fill_aabb(active_cubes.bounds_aabb(), ());
     let level = level_with_grids(&samples, Vec::new(), &active_cubes);
     let compact = CompactPlot {
+        simulation_time: 0.0,
+        variables: Vec::new(),
         variable_count: 1,
         refinement_ratios: Vec::new(),
         component_ids: vec![0],
@@ -467,6 +469,8 @@ fn single_plane_compact() -> CompactPlot {
     let mut active_cubes = SparseGrid3::new(UVec3::ONE);
     active_cubes.set(UVec3::ZERO, ());
     CompactPlot {
+        simulation_time: 0.0,
+        variables: Vec::new(),
         variable_count: 1,
         refinement_ratios: Vec::new(),
         component_ids: vec![0],

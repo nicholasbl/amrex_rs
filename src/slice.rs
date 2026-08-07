@@ -584,6 +584,8 @@ mod tests {
         }
         let eligible_cubes = crate::compact::build_active_dual_cubes(&u, &[u.bounds_aabb()]);
         CompactPlot {
+            simulation_time: 0.0,
+            variables: Vec::new(),
             variable_count: 2,
             refinement_ratios: Vec::new(),
             component_ids: vec![0, 1],
@@ -602,6 +604,8 @@ mod tests {
         let mut u = SparseGrid3::new(UVec3::ONE);
         u.set(UVec3::ZERO, 2.0);
         CompactPlot {
+            simulation_time: 0.0,
+            variables: Vec::new(),
             variable_count: 1,
             refinement_ratios: Vec::new(),
             component_ids: vec![0],
