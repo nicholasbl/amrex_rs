@@ -74,17 +74,17 @@ println!(
 
 ## OBJ Example
 
-The included example writes an OBJ mesh:
+The included binary writes an OBJ mesh:
 
 ```sh
-cargo run --example isosurface -- \
+cargo run --bin isosurface -- \
   /path/to/plt00010 density 1.0 surface.obj
 ```
 
 Up to two additional variables can be sampled onto `mesh.uv` and written as OBJ texture coordinates:
 
 ```sh
-cargo run --example isosurface -- \
+cargo run --bin isosurface -- \
   /path/to/plt00010 density 1.0 surface.obj \
   --sample temperature 0.0 10.0 \
   --sample pressure 1.0 5.0

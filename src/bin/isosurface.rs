@@ -1,16 +1,19 @@
 use std::{
-    env,
+    env, fs,
     fs::File,
     io::{BufWriter, Write},
     ops::RangeInclusive,
     path::{Path, PathBuf},
 };
 
-use amrex_rs::{IsosurfaceOptions, Mesh3D, PlotFile, Sample, Surface, isosurface};
+use amrex_rs::{
+    CompactPlot, IsosurfaceOptions, Mesh3D, PlotFile, Sample, Surface, Variable, isosurface,
+    isosurface_compact, read_compact,
+};
 use anyhow::{Context, Result, bail, ensure};
 
 struct Args {
-    plotfile: PathBuf,
+    input: PathBuf,
     variable: String,
     isovalue: f64,
     output: PathBuf,
@@ -19,7 +22,9 @@ struct Args {
 
 fn usage(program: &str) -> String {
     format!(
-        "Usage: {program} <plotfile> <variable> <isovalue> <output.obj> [options]\n\
+        "Usage: {program} <input> <variable> <isovalue> <output.obj> [options]\n\
+         \n\
+         <input> may be an AMReX plotfile directory or a compact archive.\n\
          \n\
          Options:\n\
            --sample <variable> <min> <max>  Map a quantity to U or V (repeat at most twice)\n\
@@ -41,7 +46,7 @@ fn parse_args() -> Result<Option<Args>> {
     }
     ensure!(values.len() >= 4, "{}", usage(&program));
 
-    let plotfile = PathBuf::from(&values[0]);
+    let input = PathBuf::from(&values[0]);
     let variable = values[1].clone();
     let isovalue = values[2]
         .parse::<f64>()
@@ -73,7 +78,7 @@ fn parse_args() -> Result<Option<Args>> {
     }
 
     Ok(Some(Args {
-        plotfile,
+        input,
         variable,
         isovalue,
         output,
@@ -81,11 +86,55 @@ fn parse_args() -> Result<Option<Args>> {
     }))
 }
 
-fn component_id(plotfile: &PlotFile, name: &str) -> Result<u32> {
-    let variable = plotfile
-        .variable(name)
-        .with_context(|| format!("plotfile has no variable named {name:?}"))?;
+fn component_id(variables: &[Variable], name: &str) -> Result<u32> {
+    let variable = variables
+        .iter()
+        .find(|variable| variable.name == name)
+        .with_context(|| format!("input has no variable named {name:?}"))?;
     u32::try_from(variable.index).context("variable index does not fit in u32")
+}
+
+fn isosurface_options(variables: &[Variable], args: &Args) -> Result<IsosurfaceOptions> {
+    let surface_id = component_id(variables, &args.variable)?;
+    let sampled_quantities = args
+        .samples
+        .iter()
+        .map(|(name, range)| {
+            Ok(Sample {
+                id: component_id(variables, name)?,
+                range: range.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(IsosurfaceOptions {
+        surface: Surface {
+            id: surface_id,
+            value: args.isovalue,
+        },
+        sampled_quantities,
+        levels: None,
+        flip_winding: false,
+    })
+}
+
+fn load_compact(path: &Path) -> Result<CompactPlot> {
+    let bytes =
+        fs::read(path).with_context(|| format!("reading compact archive {}", path.display()))?;
+    read_compact(&bytes).with_context(|| format!("reading compact archive {}", path.display()))
+}
+
+fn extract_isosurface(args: &Args) -> Result<Mesh3D> {
+    if args.input.is_dir() {
+        let plotfile = PlotFile::open(&args.input)
+            .with_context(|| format!("opening plotfile {}", args.input.display()))?;
+        let options = isosurface_options(plotfile.variables(), args)?;
+        isosurface(&plotfile, options)
+    } else {
+        let compact = load_compact(&args.input)?;
+        let options = isosurface_options(compact.variables(), args)?;
+        isosurface_compact(&compact, options)
+    }
 }
 
 fn write_obj(path: &Path, mesh: &Mesh3D, write_uvs: bool) -> Result<()> {
@@ -122,32 +171,7 @@ fn main() -> Result<()> {
     let Some(args) = parse_args()? else {
         return Ok(());
     };
-    let plotfile = PlotFile::open(&args.plotfile)
-        .with_context(|| format!("opening plotfile {}", args.plotfile.display()))?;
-    let surface_id = component_id(&plotfile, &args.variable)?;
-    let sampled_quantities = args
-        .samples
-        .iter()
-        .map(|(name, range)| {
-            Ok(Sample {
-                id: component_id(&plotfile, name)?,
-                range: range.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let mesh = isosurface(
-        &plotfile,
-        IsosurfaceOptions {
-            surface: Surface {
-                id: surface_id,
-                value: args.isovalue,
-            },
-            sampled_quantities,
-            levels: None,
-            flip_winding: false,
-        },
-    )?;
+    let mesh = extract_isosurface(&args)?;
     write_obj(&args.output, &mesh, !args.samples.is_empty())?;
     eprintln!(
         "wrote {} vertices and {} faces to {}",
