@@ -1,14 +1,15 @@
 use std::{
-    env, fs,
-    fs::File,
+    env,
+    fs::{self, File},
     io::{BufWriter, Write},
     ops::RangeInclusive,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use amrex_rs::{
-    CompactPlot, IsosurfaceOptions, Mesh3D, PlotFile, Sample, Surface, Variable, isosurface,
-    isosurface_compact, read_compact,
+    CompactPlot, IsosurfaceOptions, Mesh3D, PlotFile, Sample, Surface, Variable,
+    isosurface::IsosurfaceTimings, isosurface_compact, read_compact,
 };
 use anyhow::{Context, Result, bail, ensure};
 
@@ -124,16 +125,42 @@ fn load_compact(path: &Path) -> Result<CompactPlot> {
     read_compact(&bytes).with_context(|| format!("reading compact archive {}", path.display()))
 }
 
-fn extract_isosurface(args: &Args) -> Result<Mesh3D> {
+pub struct ExtractionTimings {
+    pub input_load_time: Duration,
+    pub isosurface_time: IsosurfaceTimings,
+}
+
+fn extract_isosurface(args: &Args) -> Result<(Mesh3D, ExtractionTimings)> {
     if args.input.is_dir() {
+        let now = Instant::now();
         let plotfile = PlotFile::open(&args.input)
             .with_context(|| format!("opening plotfile {}", args.input.display()))?;
         let options = isosurface_options(plotfile.variables(), args)?;
-        isosurface(&plotfile, options)
+        let input_load_time = now.elapsed();
+        amrex_rs::isosurface(&plotfile, options).map(|(m, t)| {
+            (
+                m,
+                ExtractionTimings {
+                    input_load_time,
+                    isosurface_time: t,
+                },
+            )
+        })
     } else {
+        let now = Instant::now();
         let compact = load_compact(&args.input)?;
         let options = isosurface_options(compact.variables(), args)?;
-        isosurface_compact(&compact, options)
+        let input_load_time = now.elapsed();
+
+        isosurface_compact(&compact, options).map(|(m, t)| {
+            (
+                m,
+                ExtractionTimings {
+                    input_load_time,
+                    isosurface_time: t,
+                },
+            )
+        })
     }
 }
 
@@ -171,7 +198,7 @@ fn main() -> Result<()> {
     let Some(args) = parse_args()? else {
         return Ok(());
     };
-    let mesh = extract_isosurface(&args)?;
+    let (mesh, timings) = extract_isosurface(&args)?;
     write_obj(&args.output, &mesh, !args.samples.is_empty())?;
     eprintln!(
         "wrote {} vertices and {} faces to {}",
@@ -179,6 +206,28 @@ fn main() -> Result<()> {
         mesh.indices.len(),
         args.output.display()
     );
+
+    eprintln!(
+        "timings: input_load {}, plotfile_compact_load {}, dual_grid {}",
+        timings.input_load_time.as_secs_f32(),
+        timings
+            .isosurface_time
+            .plotfile_compact_load_time
+            .as_secs_f32(),
+        timings.isosurface_time.dual_grid_time.as_secs_f32()
+    );
+
+    for (level_i, per_level_timings) in timings.isosurface_time.per_level_timings.iter().enumerate()
+    {
+        eprintln!(
+            "timings, level {}: mesh {}, merge {}, wind: {}",
+            level_i,
+            per_level_timings.mesh_generation_time.as_secs_f32(),
+            per_level_timings.merge_in_time.as_secs_f32(),
+            per_level_timings.winding_time.as_secs_f32()
+        );
+    }
+
     Ok(())
 }
 

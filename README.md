@@ -53,7 +53,7 @@ use amrex_rs::{IsosurfaceOptions, PlotFile, Surface, isosurface};
 
 let plotfile = PlotFile::open("plt00010")?;
 let density = plotfile.variable("density").unwrap();
-let mesh = isosurface(
+let (mesh, _) = isosurface(
     &plotfile,
     IsosurfaceOptions {
         surface: Surface {

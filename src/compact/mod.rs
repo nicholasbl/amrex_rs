@@ -4,6 +4,7 @@
 //! can be reused by isosurface extraction without rereading AMReX FAB shards.
 
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use crate::sparse_amr::{SparseAmr, SparseAmrLevel};
 use crate::utility::{Aabb3u, SparseGrid3, SparseGridChunkView};
@@ -23,6 +24,14 @@ pub struct CompactOptions {
     pub component_ids: Vec<u32>,
 }
 
+/// Result from a compaction operation
+#[derive(Debug, Default)]
+pub struct WriteCompactResult {
+    pub compact_time: Duration,
+    pub archive_time: Duration,
+    pub serialization_time: Duration,
+}
+
 /// Write selected plotfile components as a compact binary archive.
 ///
 /// The archive format is intended for this crate's reader and may evolve while
@@ -31,12 +40,30 @@ pub fn write_compact(
     plot_file: &PlotFile,
     options: CompactOptions,
     dest: &mut impl Write,
-) -> Result<()> {
+) -> Result<WriteCompactResult> {
+    let now = Instant::now();
+
     let component_ids = selected_component_ids(plot_file, &options)?;
     let compact = CompactPlot::load(plot_file, &component_ids)?;
+
+    let compact_time = now.elapsed();
+    let now = Instant::now();
+
     let archive = CompactArchive::from_plot(plot_file.header(), compact)?;
-    let bytes = rkyv::to_bytes::<Error>(&archive).context("serializing compact plot")?;
-    dest.write_all(&bytes).context("writing compact plot")
+    let archive_time = now.elapsed();
+    let now = Instant::now();
+
+    let io_writer = rkyv::ser::writer::IoWriter::new(dest);
+    rkyv::api::high::to_bytes_in::<_, Error>(&archive, io_writer)
+        .context("serializing compact plot")?;
+
+    let serialization_time = now.elapsed();
+
+    Ok(WriteCompactResult {
+        compact_time,
+        archive_time,
+        serialization_time,
+    })
 }
 
 /// Read a compact binary archive produced by [`write_compact`].
@@ -655,7 +682,7 @@ mod tests {
                     "compact archive changed variable index"
                 );
             }
-            let mesh = crate::isosurface_compact(
+            let (mesh, _) = crate::isosurface_compact(
                 &compact,
                 crate::IsosurfaceOptions {
                     surface: crate::Surface { id: 0, value: 0.5 },

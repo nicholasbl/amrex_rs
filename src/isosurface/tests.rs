@@ -191,7 +191,7 @@ fn public_mesher_extracts_across_active_chunks() -> Result<()> {
         }],
     };
 
-    let mesh = isosurface_compact(
+    let (mesh, _) = isosurface_compact(
         &compact,
         IsosurfaceOptions {
             surface: Surface { id: 0, value: 0.5 },
@@ -215,7 +215,7 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
 
     let result = (|| -> Result<()> {
         let plotfile = PlotFile::open(&root)?;
-        let mesh = isosurface(
+        let (mesh, _) = isosurface(
             &plotfile,
             IsosurfaceOptions {
                 surface: Surface { id: 0, value: 0.5 },
@@ -228,7 +228,7 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
         ensure!(!mesh.indices.is_empty(), "expected extracted faces");
 
         let compact = CompactPlot::load(&plotfile, &[0])?;
-        let mesh = isosurface_compact(
+        let (mesh, _) = isosurface_compact(
             &compact,
             IsosurfaceOptions {
                 surface: Surface { id: 0, value: 0.5 },
@@ -243,7 +243,7 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
         );
         ensure!(!mesh.indices.is_empty(), "expected compact extracted faces");
 
-        let mesh = isosurface_compact(
+        let (mesh, _) = isosurface_compact(
             &compact,
             IsosurfaceOptions {
                 surface: Surface { id: 0, value: 0.5 },
@@ -257,7 +257,7 @@ fn public_api_extracts_from_a_plotfile() -> Result<()> {
             "expected selected level extracted vertices"
         );
 
-        let mesh = isosurface_compact(
+        let (mesh, _) = isosurface_compact(
             &compact,
             IsosurfaceOptions {
                 surface: Surface { id: 0, value: 0.5 },
@@ -291,7 +291,7 @@ fn flip_face_winding_swaps_new_face_orientation() {
 #[test]
 fn public_mesher_flip_winding_inverts_lower_quantity_front_face() -> Result<()> {
     let compact = single_plane_compact();
-    let mesh = isosurface_compact(
+    let (mesh, _) = isosurface_compact(
         &compact,
         IsosurfaceOptions {
             surface: Surface { id: 0, value: 0.5 },
@@ -307,7 +307,7 @@ fn public_mesher_flip_winding_inverts_lower_quantity_front_face() -> Result<()> 
             .all(|&face| triangle_normal(&mesh.positions, face).dot(Vec3::X) < 0.0)
     );
 
-    let flipped = isosurface_compact(
+    let (flipped, _) = isosurface_compact(
         &compact,
         IsosurfaceOptions {
             surface: Surface { id: 0, value: 0.5 },

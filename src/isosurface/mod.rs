@@ -8,8 +8,9 @@ mod dual_grid;
 mod mc33;
 mod sampling;
 
-use std::collections::HashMap;
 use std::ops::RangeInclusive;
+use std::time::Instant;
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use rayon::prelude::*;
@@ -378,20 +379,51 @@ fn validate_isosurface_options(
     Ok((component, isovalue, sample_specs))
 }
 
+#[derive(Debug)]
+pub struct PerLevelTimings {
+    pub mesh_generation_time: Duration,
+
+    pub merge_in_time: Duration,
+
+    pub winding_time: Duration,
+}
+
+#[derive(Debug)]
+pub struct IsosurfaceTimings {
+    pub plotfile_compact_load_time: Duration,
+
+    pub dual_grid_time: Duration,
+
+    pub per_level_timings: Vec<PerLevelTimings>,
+}
+
 /// Load required data from a plotfile and extract an isosurface.
 ///
 /// This is the convenience entry point for direct plotfile use. It loads the
 /// requested surface component and sampled components into the compact sparse
 /// representation before meshing.
-pub fn isosurface(plot_file: &PlotFile, options: IsosurfaceOptions) -> Result<Mesh3D> {
+pub fn isosurface(
+    plot_file: &PlotFile,
+    options: IsosurfaceOptions,
+) -> Result<(Mesh3D, IsosurfaceTimings)> {
     let (component, _, sample_specs) =
         validate_isosurface_options(plot_file.variables().len(), &options)?;
+
     let sampled_components = sample_specs
         .iter()
         .map(|sample| sample.component)
         .collect::<Vec<_>>();
+
+    let now = Instant::now();
+
     let compact_plot = load_compact_for_isosurface(plot_file, component, &sampled_components)?;
-    isosurface_compact(&compact_plot, options)
+
+    let plotfile_compact_load_time = now.elapsed();
+
+    isosurface_compact(&compact_plot, options).map(|(m, mut t)| {
+        t.plotfile_compact_load_time += plotfile_compact_load_time;
+        (m, t)
+    })
 }
 
 /// Extract an isosurface from an already-loaded compact plot.
@@ -401,37 +433,71 @@ pub fn isosurface(plot_file: &PlotFile, options: IsosurfaceOptions) -> Result<Me
 pub fn isosurface_compact(
     compact_plot: &CompactPlot,
     options: IsosurfaceOptions,
-) -> Result<Mesh3D> {
+) -> Result<(Mesh3D, IsosurfaceTimings)> {
     let (component, isovalue, sample_specs) =
         validate_isosurface_options(compact_plot.variable_count(), &options)?;
+
     let sampled_components = sample_specs
         .iter()
         .map(|sample| sample.component)
         .collect::<Vec<_>>();
+
+    let now = Instant::now();
+
     let levels = dual_grid_levels_from_compact(
         compact_plot,
         component,
         &sampled_components,
         options.levels.as_ref(),
     )?;
+
     let ranges = sample_specs
         .iter()
         .map(|sample| sample.range)
         .collect::<Vec<_>>();
+
+    let dual_grid_time = now.elapsed();
+
     let mut mesh = Mesh3D::default();
 
+    let mut per_level_timings = vec![];
+
     for level in &levels {
+        let now = Instant::now();
+
         let index_start = mesh.indices.len();
         let level_mesh = mesh_level_parallel(level, &ranges, isovalue)
             .with_context(|| format!("extracting level {}", level.level_index))?;
+
+        let mesh_generation_time = now.elapsed();
+        let now = Instant::now();
+
         merge_mesh(&mut mesh, level_mesh)?;
+
+        let merge_in_time = now.elapsed();
+        let now = Instant::now();
 
         if options.flip_winding {
             flip_face_winding(&mut mesh.indices[index_start..]);
         }
+
+        let winding_time = now.elapsed();
+
+        per_level_timings.push(PerLevelTimings {
+            mesh_generation_time,
+            merge_in_time,
+            winding_time,
+        });
     }
 
-    Ok(mesh)
+    Ok((
+        mesh,
+        IsosurfaceTimings {
+            plotfile_compact_load_time: Duration::ZERO,
+            dual_grid_time,
+            per_level_timings,
+        },
+    ))
 }
 
 fn mesh_level_parallel(
