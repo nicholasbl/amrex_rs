@@ -501,6 +501,7 @@ where
     /// AABB outside `fine_mask` are clipped.
     ///
     /// Returns the number of destination voxels removed. A scale of zero is a no-op.
+
     pub fn mask_out_by_presence_scaled<M>(
         &mut self,
         fine_mask: &SparseGrid3<M>,
@@ -508,51 +509,47 @@ where
         translation: I64Vec3,
     ) -> usize
     where
-        M: Copy + PartialEq,
+        T: Send,
+        M: Copy + PartialEq + Sync,
     {
         if scale == 0 || fine_mask.is_empty() || self.is_empty() {
             return 0;
         }
 
-        let keys: Vec<ChunkKey> = self.chunks.keys().copied().collect();
-        let mut removed = 0usize;
-        let mut empty_keys = Vec::new();
         let dst_bounds = self.bounds_aabb();
+        let fine_bounds = fine_mask.bounds;
 
-        for key in keys {
-            let Some((local_min, local_max)) = chunk_local_intersection(key, dst_bounds) else {
-                continue;
-            };
-            let chunk_min = key.world_min();
+        use rayon::iter::IntoParallelRefMutIterator;
+        use rayon::iter::ParallelIterator;
 
-            let Some(chunk) = self.chunks.get_mut(&key) else {
-                continue;
-            };
-
-            let chunk_removed = chunk.clear_where_present(local_min, local_max, |idx| {
-                let local = local_from_index(idx);
-                let coarse_pos = add_uvec3(chunk_min, local);
-                let Some(mask_aabb) = scaled_voxel_aabb_in_fine_grid(
-                    coarse_pos,
-                    scale,
-                    translation,
-                    fine_mask.bounds,
-                ) else {
-                    return false;
+        let removed: usize = self
+            .chunks
+            .par_iter_mut()
+            .map(|(&key, chunk)| {
+                let Some((local_min, local_max)) = chunk_local_intersection(key, dst_bounds) else {
+                    return 0;
                 };
-                fine_mask.any_present_in_aabb(mask_aabb)
-            });
 
-            removed = removed.saturating_add(chunk_removed);
+                let chunk_min = key.world_min();
 
-            if chunk.is_empty() {
-                empty_keys.push(key);
-            }
-        }
+                chunk.clear_where_present(local_min, local_max, |idx| {
+                    let local = local_from_index(idx);
+                    let coarse_pos = add_uvec3(chunk_min, local);
 
-        for key in empty_keys {
-            self.chunks.remove(&key);
-        }
+                    let Some(mask_aabb) =
+                        scaled_voxel_aabb_in_fine_grid(coarse_pos, scale, translation, fine_bounds)
+                    else {
+                        return false;
+                    };
+
+                    fine_mask.any_present_in_aabb(mask_aabb)
+                })
+            })
+            .sum();
+
+        // Can't modify the HashMap structure while par_iter_mut() is active,
+        // so remove emptied chunks afterward.
+        self.chunks.retain(|_, chunk| !chunk.is_empty());
 
         removed
     }

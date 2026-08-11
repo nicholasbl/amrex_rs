@@ -91,11 +91,14 @@ pub(super) fn dual_grid_levels_from_compact<'a>(
                 .refinement_ratios
                 .get(compact_level.level_index - 1)
                 .context("refinement ratio is absent for compact level")?;
+
             let ratio = u32::try_from(*ratio).context("refinement ratio does not fit in u32")?;
+
             ensure!(ratio > 0, "refinement ratio must be nonzero");
 
             let translation =
                 level_translation(coarse.index_origin, compact_level.index_origin, ratio)?;
+
             coarse
                 .active_cubes
                 .mask_out_by_presence_scaled(samples, ratio, translation);
