@@ -12,6 +12,7 @@ use crate::{BoundingBox, CoordinateSystem, Header, IndexDomain, PlotFile, Variab
 
 use anyhow::{Context, Result, ensure};
 use glam::{DVec3, IVec3, UVec3};
+use rkyv::Portable;
 use rkyv::{Archive, Deserialize, Serialize, rancor::Error};
 
 const FORMAT_MAGIC: [u8; 8] = *b"AMRCMPCT";
