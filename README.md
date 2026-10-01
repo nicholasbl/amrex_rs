@@ -118,6 +118,9 @@ cargo run --release --bin pltcompact -- \
   /path/to/plt00010 plt00010.compact
 ```
 
+On completion, `pltcompact` reports the compact-load, archive-building, and
+serialization timings to standard error in seconds.
+
 The `isosurface` binary accepts the resulting archive anywhere it accepts a
 plotfile directory. The surface variable and every `--sample` variable must have
 been included when the archive was created:

@@ -1,4 +1,9 @@
-use std::{env, fs::File, io::BufWriter, path::PathBuf};
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Write},
+    path::PathBuf,
+};
 
 use amrex_rs::{CompactOptions, PlotFile, write_compact};
 use anyhow::{Context, Result, bail};
@@ -25,12 +30,22 @@ fn main() -> Result<()> {
         .with_context(|| format!("creating compact archive {}", args.output.display()))?;
     let mut writer = BufWriter::new(file);
 
-    write_compact(
+    let timings = write_compact(
         &plotfile,
         CompactOptions { component_ids: ids },
         &mut writer,
     )
     .with_context(|| format!("writing compact archive {}", args.output.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("flushing compact archive {}", args.output.display()))?;
+
+    eprintln!(
+        "timings: compact {}, archive {}, serialization {}",
+        timings.compact_time.as_secs_f32(),
+        timings.archive_time.as_secs_f32(),
+        timings.serialization_time.as_secs_f32()
+    );
 
     Ok(())
 }
