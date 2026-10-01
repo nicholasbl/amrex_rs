@@ -92,7 +92,43 @@ cargo run --bin isosurface -- \
 
 ## Compact Archives
 
-Use compact archives when you want to load selected components once and reuse them:
+The `pltcompact` binary converts an AMReX plotfile directory into a single compact
+archive. This is useful when repeatedly extracting surfaces from the same data: the
+archive stores the selected components in the sparse layout used by the isosurface
+code, so the original FAB files do not need to be read and compacted on every run.
+
+The command takes zero or more variable names, followed by the input plotfile and
+output archive:
+
+```text
+pltcompact [<variable> ...] <input_plt> <output_archive>
+```
+
+Variable names are case-sensitive. To archive only `density` and `temperature`:
+
+```sh
+cargo run --release --bin pltcompact -- \
+  density temperature /path/to/plt00010 plt00010.compact
+```
+
+Omit the variable names to include every variable in the plotfile:
+
+```sh
+cargo run --release --bin pltcompact -- \
+  /path/to/plt00010 plt00010.compact
+```
+
+The `isosurface` binary accepts the resulting archive anywhere it accepts a
+plotfile directory. The surface variable and every `--sample` variable must have
+been included when the archive was created:
+
+```sh
+cargo run --release --bin isosurface -- \
+  plt00010.compact density 1.0 surface.obj \
+  --sample temperature 0.0 10.0
+```
+
+The same functionality is available through the library API:
 
 ```rust
 use amrex_rs::{CompactOptions, PlotFile, read_compact, write_compact};
@@ -110,6 +146,9 @@ write_compact(
 let compact = read_compact(&bytes)?;
 println!("original variable count = {}", compact.variable_count());
 ```
+
+An empty `component_ids` list selects all variables. Otherwise, component IDs are
+the zero-based indices exposed by `PlotFile::variables()`.
 
 ## Notes
 
