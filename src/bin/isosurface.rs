@@ -1,6 +1,6 @@
 use std::{
     env,
-    fs::{self, File},
+    fs::File,
     io::{BufWriter, Write},
     ops::RangeInclusive,
     path::{Path, PathBuf},
@@ -120,8 +120,8 @@ fn isosurface_options(variables: &[Variable], args: &Args) -> Result<IsosurfaceO
 }
 
 fn load_compact(path: &Path) -> Result<CompactPlot> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("reading compact archive {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("reading compact archive {}", path.display()))?;
 
     let mmap = unsafe { memmap2::Mmap::map(&file).context("memory mapping file") }?;
 
