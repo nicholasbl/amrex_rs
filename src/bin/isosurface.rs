@@ -120,9 +120,12 @@ fn isosurface_options(variables: &[Variable], args: &Args) -> Result<IsosurfaceO
 }
 
 fn load_compact(path: &Path) -> Result<CompactPlot> {
-    let bytes =
-        fs::read(path).with_context(|| format!("reading compact archive {}", path.display()))?;
-    read_compact(&bytes).with_context(|| format!("reading compact archive {}", path.display()))
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("reading compact archive {}", path.display()))?;
+
+    let mmap = unsafe { memmap2::Mmap::map(&file).context("memory mapping file") }?;
+
+    read_compact(&mmap).with_context(|| format!("reading compact archive {}", path.display()))
 }
 
 pub struct ExtractionTimings {
