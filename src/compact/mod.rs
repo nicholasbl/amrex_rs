@@ -73,6 +73,171 @@ pub fn read_compact(bytes: &[u8]) -> Result<CompactPlot> {
     archive.into_compact_plot()
 }
 
+/// A zero-copy, read-only view of compact archive metadata.
+///
+/// The view borrows the archive bytes and does not deserialize level grids,
+/// chunks, masks, or component values.
+pub struct CompactArchiveView<'a> {
+    archive: &'a ArchivedCompactArchive,
+}
+
+/// Validate a compact archive and return a zero-copy view of its metadata.
+///
+/// Validation checks the complete archived object graph. It does not allocate
+/// or deserialize the archived grids, but its initial cost is proportional to
+/// the size of the archive.
+pub fn view_compact(bytes: &[u8]) -> Result<CompactArchiveView<'_>> {
+    let archive = rkyv::access::<ArchivedCompactArchive, Error>(bytes)
+        .context("validating compact archive")?;
+    validate_archive_envelope(archive)?;
+    Ok(CompactArchiveView { archive })
+}
+
+/// Return a zero-copy metadata view without validating the archived object graph.
+///
+/// This still checks the compact format magic, version, and chunk size. Unlike
+/// [`view_compact`], opening the view does not traverse the archive.
+///
+/// # Safety
+///
+/// `bytes` must contain a valid, properly aligned `CompactArchive` produced for
+/// this build's rkyv format, and the bytes must not be mutated for the lifetime
+/// of the returned view. Passing malformed bytes can cause undefined behavior.
+pub unsafe fn view_compact_unchecked(bytes: &[u8]) -> Result<CompactArchiveView<'_>> {
+    // SAFETY: The caller guarantees that `bytes` contain a valid archived
+    // `CompactArchive` and remain immutable for the returned view's lifetime.
+    let archive = unsafe { rkyv::access_unchecked::<ArchivedCompactArchive>(bytes) };
+    validate_archive_envelope(archive)?;
+    Ok(CompactArchiveView { archive })
+}
+
+impl CompactArchiveView<'_> {
+    /// Simulation time from the original plotfile header.
+    pub fn simulation_time(&self) -> f64 {
+        self.archive.header.simulation_time.to_native()
+    }
+
+    /// Finest AMR level index in the original plotfile.
+    pub fn finest_level(&self) -> usize {
+        self.archive.header.finest_level.to_native() as usize
+    }
+
+    /// Physical domain bounds as `(minimum, maximum)`.
+    pub fn domain(&self) -> ([f64; 3], [f64; 3]) {
+        (
+            self.archive
+                .header
+                .domain
+                .min
+                .map(|value| value.to_native()),
+            self.archive
+                .header
+                .domain
+                .max
+                .map(|value| value.to_native()),
+        )
+    }
+
+    /// Variables from the original plotfile as `(name, index)` pairs.
+    pub fn variables(&self) -> impl ExactSizeIterator<Item = (&str, usize)> {
+        self.archive
+            .header
+            .variables
+            .iter()
+            .map(|variable| (variable.name.as_str(), variable.index.to_native() as usize))
+    }
+
+    /// Refinement ratios between adjacent AMR levels.
+    pub fn refinement_ratios(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.archive
+            .header
+            .refinement_ratios
+            .iter()
+            .map(|ratio| ratio.to_native() as usize)
+    }
+
+    /// Per-level index domains as `(minimum, maximum, index_type)` tuples.
+    pub fn index_domains(
+        &self,
+    ) -> impl ExactSizeIterator<Item = ([i32; 3], [i32; 3], [i32; 3])> + '_ {
+        self.archive.header.index_domains.iter().map(|domain| {
+            (
+                domain.min.map(|value| value.to_native()),
+                domain.max.map(|value| value.to_native()),
+                domain.index_type.map(|value| value.to_native()),
+            )
+        })
+    }
+
+    /// Per-level time step counters.
+    pub fn level_steps(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.archive
+            .header
+            .level_steps
+            .iter()
+            .map(|step| step.to_native() as usize)
+    }
+
+    /// Per-level cell sizes.
+    pub fn cell_sizes(&self) -> impl ExactSizeIterator<Item = [f64; 3]> + '_ {
+        self.archive
+            .header
+            .cell_sizes
+            .iter()
+            .map(|size| size.map(|value| value.to_native()))
+    }
+
+    /// Coordinate-system identifier from the AMReX header.
+    pub fn coordinate_system(&self) -> CoordinateSystem {
+        match self.archive.header.coordinate_system {
+            0 => CoordinateSystem::Cartesian,
+            1 => CoordinateSystem::Cylindrical,
+            2 => CoordinateSystem::Spherical,
+            _ => unreachable!("compact archive coordinate system was validated"),
+        }
+    }
+
+    /// Plotfile boundary width.
+    pub fn boundary_width(&self) -> usize {
+        self.archive.header.boundary_width.to_native() as usize
+    }
+
+    /// Original plotfile component ids stored in this archive.
+    pub fn component_ids(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.archive
+            .component_ids
+            .iter()
+            .map(|id| id.to_native() as usize)
+    }
+
+    /// Number of AMR levels stored in this archive.
+    pub fn level_count(&self) -> usize {
+        self.archive.levels.len()
+    }
+}
+
+fn validate_archive_envelope(archive: &ArchivedCompactArchive) -> Result<()> {
+    ensure!(
+        archive.magic == FORMAT_MAGIC,
+        "invalid compact archive magic"
+    );
+    ensure!(
+        archive.version == FORMAT_VERSION,
+        "unsupported compact archive version {}",
+        archive.version
+    );
+    ensure!(
+        archive.chunk_bits == crate::utility::CHUNK_BITS,
+        "unsupported compact chunk size"
+    );
+    ensure!(
+        archive.header.coordinate_system <= 2,
+        "invalid compact archive coordinate system {}",
+        archive.header.coordinate_system
+    );
+    Ok(())
+}
+
 #[derive(Archive, Deserialize, Serialize)]
 struct CompactArchive {
     magic: [u8; 8],
@@ -662,6 +827,39 @@ mod tests {
             let mut bytes = Vec::new();
             write_compact(&plotfile, CompactOptions::default(), &mut bytes)?;
             ensure!(!bytes.is_empty(), "compact archive is empty");
+
+            let view = view_compact(&bytes)?;
+            ensure!(
+                view.simulation_time() == plotfile.header().simulation_time,
+                "compact metadata view changed simulation time"
+            );
+            ensure!(
+                view.variables()
+                    .zip(plotfile.variables())
+                    .all(|((name, index), expected)| name == expected.name
+                        && index == expected.index),
+                "compact metadata view changed variables"
+            );
+            ensure!(
+                view.component_ids().eq(0..plotfile.variables().len()),
+                "compact metadata view changed component ids"
+            );
+            ensure!(
+                view.level_count() == plotfile.header().finest_level + 1,
+                "compact metadata view changed level count"
+            );
+
+            // SAFETY: `bytes` were just produced by `write_compact` and remain
+            // immutable while the unchecked view is used.
+            let unchecked_view = unsafe { view_compact_unchecked(&bytes)? };
+            ensure!(
+                unchecked_view.simulation_time() == view.simulation_time(),
+                "unchecked metadata view changed simulation time"
+            );
+            ensure!(
+                unchecked_view.variables().eq(view.variables()),
+                "unchecked metadata view changed variables"
+            );
 
             let compact = read_compact(&bytes)?;
             ensure!(
