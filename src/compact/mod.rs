@@ -439,6 +439,35 @@ pub struct CompactPlot {
     pub(crate) levels: Vec<CompactLevel>,
 }
 
+/// Summary of the values stored for one component in a compact archive.
+///
+/// `min` and `max` include infinite values but ignore NaNs. They are `None`
+/// when the component contains no non-NaN values.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CompactComponentStats {
+    /// Number of present values across all AMR levels, including NaNs.
+    pub value_count: usize,
+    /// Number of present values that are NaN.
+    pub nan_count: usize,
+    /// Smallest non-NaN value across all AMR levels.
+    pub min: Option<f32>,
+    /// Largest non-NaN value across all AMR levels.
+    pub max: Option<f32>,
+}
+
+impl CompactComponentStats {
+    fn observe(&mut self, value: f32) {
+        self.value_count += 1;
+        if value.is_nan() {
+            self.nan_count += 1;
+            return;
+        }
+
+        self.min = Some(self.min.map_or(value, |current| current.min(value)));
+        self.max = Some(self.max.map_or(value, |current| current.max(value)));
+    }
+}
+
 pub(crate) struct CompactLevel {
     pub(crate) level_index: usize,
     pub(crate) index_origin: IVec3,
@@ -521,6 +550,31 @@ impl CompactPlot {
     /// Number of variables in the original plotfile.
     pub fn variable_count(&self) -> usize {
         self.variable_count
+    }
+
+    /// Original plotfile component ids stored in this compact plot.
+    pub fn component_ids(&self) -> &[usize] {
+        &self.component_ids
+    }
+
+    /// Number of AMR levels stored in this compact plot.
+    pub fn level_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Compute value statistics for a stored component across all AMR levels.
+    ///
+    /// Returns `None` when `component_id` is not present in the compact plot.
+    pub fn component_stats(&self, component_id: usize) -> Option<CompactComponentStats> {
+        let slot = self.component_slot(component_id)?;
+        let mut stats = CompactComponentStats::default();
+
+        for level in &self.levels {
+            let grid = &level.components[slot];
+            grid.for_each_present_in_aabb(grid.bounds_aabb(), |_, value| stats.observe(value));
+        }
+
+        Some(stats)
     }
 
     pub(crate) fn component_slot(&self, component_id: usize) -> Option<usize> {
@@ -983,6 +1037,17 @@ mod tests {
                     "compact archive changed variable index"
                 );
             }
+            let stats = compact
+                .component_stats(0)
+                .context("stored density component is missing")?;
+            ensure!(stats.value_count == 8, "unexpected compact value count");
+            ensure!(stats.nan_count == 0, "unexpected NaNs in compact values");
+            ensure!(stats.min == Some(0.0), "unexpected compact minimum");
+            ensure!(stats.max == Some(1.0), "unexpected compact maximum");
+            ensure!(
+                compact.component_stats(1).is_none(),
+                "unstored component unexpectedly had statistics"
+            );
             let (mesh, _) = crate::isosurface_compact(
                 &compact,
                 crate::IsosurfaceOptions {

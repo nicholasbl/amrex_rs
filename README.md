@@ -9,6 +9,12 @@ The crate currently focuses on:
 - compact sparse AMR archives for selected components
 - MC33 isosurface extraction with optional sampled vertex quantities
 
+Inspect a compact archive and report its metadata and value ranges:
+
+```text
+cargo run --release --bin probe -- archive.compact
+```
+
 ## Basic Usage
 
 Open a plotfile and inspect its metadata:
@@ -89,6 +95,38 @@ cargo run --bin isosurface -- \
   --sample temperature 0.0 10.0 \
   --sample pressure 1.0 5.0
 ```
+
+## Mesh Decimation
+
+Clean up and decimate an extracted mesh with the meshoptimizer-backed convenience pipeline:
+
+```rust
+use amrex_rs::{
+    DecimateOptions, DecimatePipelineOptions, DecimateTarget, decimate_mesh_pipeline,
+};
+
+let result = decimate_mesh_pipeline(
+    &mut mesh,
+    DecimatePipelineOptions {
+        decimate: DecimateOptions {
+            target: DecimateTarget::FaceRatio(0.25),
+            max_error: 0.01,
+            ..DecimateOptions::default()
+        },
+        ..DecimatePipelineOptions::default()
+    },
+)?;
+
+println!(
+    "{} -> {} faces",
+    result.decimation.original_face_count,
+    result.decimation.final_face_count
+);
+```
+
+Use `decimate_mesh` directly when the mesh is already welded and free of
+degenerate triangles. Error limits can be relative to mesh extent or absolute
+in the physical units used by `Mesh3D::positions`.
 
 ## Compact Archives
 

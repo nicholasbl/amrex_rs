@@ -64,7 +64,7 @@ pub struct Mesh3D {
 }
 
 /// Thresholds used when merging duplicate mesh vertices.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DedupMeshOptions {
     /// Maximum Euclidean distance between positions for vertices to merge.
     pub position_epsilon: f32,
@@ -75,7 +75,7 @@ pub struct DedupMeshOptions {
 }
 
 /// Options controlling removal of degenerate triangles.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RemoveDegenerateTrianglesOptions {
     /// Minimum triangle area to keep.
     ///

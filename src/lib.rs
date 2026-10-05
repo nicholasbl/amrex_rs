@@ -5,6 +5,7 @@
 //! [`DataReader`], and extracting MC33 isosurfaces with [`isosurface()`].
 
 pub mod compact;
+pub mod decimate;
 mod input;
 pub mod isosurface;
 pub mod slice;
@@ -12,8 +13,12 @@ pub(crate) mod sparse_amr;
 pub mod utility;
 
 pub use compact::{
-    CompactArchiveView, CompactOptions, CompactPlot, read_compact, read_compact_selected_unchecked,
-    view_compact, view_compact_unchecked, write_compact,
+    CompactArchiveView, CompactComponentStats, CompactOptions, CompactPlot, read_compact,
+    read_compact_selected_unchecked, view_compact, view_compact_unchecked, write_compact,
+};
+pub use decimate::{
+    DecimateErrorMode, DecimateOptions, DecimatePipelineOptions, DecimatePipelineResult,
+    DecimateResult, DecimateTarget, decimate_mesh, decimate_mesh_pipeline,
 };
 pub use isosurface::{
     DedupMeshOptions, IsosurfaceOptions, Mesh3D, RemoveDegenerateTrianglesOptions, Sample, Surface,
