@@ -181,6 +181,7 @@ fn public_mesher_extracts_across_active_chunks() -> Result<()> {
         variable_count: 1,
         refinement_ratios: Vec::new(),
         component_ids: vec![0],
+        normalizations: Vec::new(),
         levels: vec![crate::compact::CompactLevel {
             level_index: 0,
             index_origin: IVec3::ZERO,
@@ -474,6 +475,7 @@ fn single_plane_compact() -> CompactPlot {
         variable_count: 1,
         refinement_ratios: Vec::new(),
         component_ids: vec![0],
+        normalizations: Vec::new(),
         levels: vec![crate::compact::CompactLevel {
             level_index: 0,
             index_origin: IVec3::ZERO,

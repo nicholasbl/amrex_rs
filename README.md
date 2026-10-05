@@ -180,6 +180,7 @@ write_compact(
     &plotfile,
     CompactOptions {
         component_ids: vec![0],
+        ..CompactOptions::default()
     },
     &mut bytes,
 )?;
@@ -191,8 +192,39 @@ println!("original variable count = {}", compact.variable_count());
 An empty `component_ids` list selects all variables. Otherwise, component IDs are
 the zero-based indices exposed by `PlotFile::variables()`.
 
+For per-variable normalization, pass a reusable TOML configuration to
+`pltcompact`:
+
+```toml
+[[variables]]
+name = "density"
+normalize = [1.0e20, 1.000000001e20]
+
+[[variables]]
+name = "temperature"
+```
+
+```sh
+cargo run --release --bin pltcompact -- \
+  --config compact.toml /path/to/plt00010 plt00010.compact
+```
+
+This lets the same variable recipe be reused across a collection of plotfiles.
+`input` and `output` may still be placed in the TOML and the shorter
+`--config compact.toml` form used. When command-line paths are supplied, they
+override the paths from the TOML.
+
+Each normalized quantity is transformed in `f64` as
+`clamp((value - min) / (max - min), 0, 1)` before conversion to the archive's
+`f32` storage. Its original bounds are retained in archive metadata and shown by
+the `probe` binary. Isovalues for normalized quantities must likewise be in the
+normalized `[0, 1]` range. Omitting `variables` selects every quantity without
+normalization.
+
 ## Notes
 
 Isosurface extraction expects cell-centered data. The mesh path uses a sparse chunked grid internally, with cached accessors in the MC33 hot path to avoid repeated hash-map lookups inside the same chunk.
 
 The compact archive format is intended for use by this crate and may change before a stable 1.0 release.
+Archives containing normalization metadata use format version 2; version 1 archives
+must be regenerated with the current `pltcompact`.

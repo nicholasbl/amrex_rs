@@ -113,8 +113,12 @@ fn main() -> Result<()> {
         } else {
             format!(", NaNs={}", stats.nan_count)
         };
+        let normalization_suffix = compact
+            .component_normalization(component_id)
+            .map(|(min, max)| format!(", normalized from [{min:.7e}, {max:.7e}]"))
+            .unwrap_or_default();
         println!(
-            "  [{component_id:>3}] {:<24} {} values={}{nan_suffix}",
+            "  [{component_id:>3}] {:<24} {} values={}{nan_suffix}{normalization_suffix}",
             variable.name,
             format_range(stats),
             stats.value_count

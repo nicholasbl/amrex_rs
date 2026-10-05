@@ -13,8 +13,9 @@ pub(crate) mod sparse_amr;
 pub mod utility;
 
 pub use compact::{
-    CompactArchiveView, CompactComponentStats, CompactOptions, CompactPlot, read_compact,
-    read_compact_selected_unchecked, view_compact, view_compact_unchecked, write_compact,
+    CompactArchiveView, CompactComponentStats, CompactNormalization, CompactOptions, CompactPlot,
+    read_compact, read_compact_selected_unchecked, view_compact, view_compact_unchecked,
+    write_compact,
 };
 pub use decimate::{
     DecimateErrorMode, DecimateOptions, DecimatePipelineOptions, DecimatePipelineResult,

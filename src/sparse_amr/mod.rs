@@ -24,7 +24,15 @@ pub(crate) struct SparseAmrLevel {
 }
 
 impl SparseAmr {
-    pub(crate) fn load(plot_file: &PlotFile, component_ids: &[usize]) -> Result<Self> {
+    pub(crate) fn load(
+        plot_file: &PlotFile,
+        component_ids: &[usize],
+        normalizations: &[Option<(f64, f64)>],
+    ) -> Result<Self> {
+        ensure!(
+            component_ids.len() == normalizations.len(),
+            "component and normalization counts differ"
+        );
         for &component in component_ids {
             ensure!(
                 component < plot_file.variables().len(),
@@ -36,8 +44,14 @@ impl SparseAmr {
         let levels = plot_file
             .levels()
             .map(|level| {
-                load_level(&reader, level, plot_file.header().domain.min, component_ids)
-                    .with_context(|| format!("loading sparse AMR level {}", level.index()))
+                load_level(
+                    &reader,
+                    level,
+                    plot_file.header().domain.min,
+                    component_ids,
+                    normalizations,
+                )
+                .with_context(|| format!("loading sparse AMR level {}", level.index()))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -53,6 +67,7 @@ fn load_level(
     level: Level<'_>,
     physical_origin: DVec3,
     component_ids: &[usize],
+    normalizations: &[Option<(f64, f64)>],
 ) -> Result<SparseAmrLevel> {
     let domain = level.index_domain();
     let bounds = index_extent(domain)?;
@@ -71,8 +86,19 @@ fn load_level(
         );
 
         let local_aabb = local_aabb(patch_box, domain)?;
-        for (&component, destination) in component_ids.iter().zip(&mut components) {
-            load_patch_component(reader, patch, component, local_aabb, destination)?;
+        for ((&component, &normalization), destination) in component_ids
+            .iter()
+            .zip(normalizations)
+            .zip(&mut components)
+        {
+            load_patch_component(
+                reader,
+                patch,
+                component,
+                normalization,
+                local_aabb,
+                destination,
+            )?;
         }
         valid_regions.push(local_aabb);
     }
@@ -92,6 +118,7 @@ fn load_patch_component(
     reader: &DataReader<'_>,
     patch: Patch<'_>,
     component: usize,
+    normalization: Option<(f64, f64)>,
     local_aabb: Aabb3u,
     destination: &mut SparseGrid3<f32>,
 ) -> Result<()> {
@@ -113,6 +140,10 @@ fn load_patch_component(
                         patch.index()
                     )
                 })?;
+                let value = match normalization {
+                    Some((min, max)) => ((value - min) / (max - min)).clamp(0.0, 1.0),
+                    None => value,
+                };
                 values.push(value as f32);
             }
         }

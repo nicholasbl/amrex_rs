@@ -589,6 +589,7 @@ mod tests {
             variable_count: 2,
             refinement_ratios: Vec::new(),
             component_ids: vec![0, 1],
+            normalizations: Vec::new(),
             levels: vec![CompactLevel {
                 level_index: 0,
                 index_origin: IVec3::ZERO,
@@ -609,6 +610,7 @@ mod tests {
             variable_count: 1,
             refinement_ratios: Vec::new(),
             component_ids: vec![0],
+            normalizations: Vec::new(),
             levels: vec![CompactLevel {
                 level_index: 0,
                 index_origin: IVec3::ZERO,

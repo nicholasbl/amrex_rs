@@ -15,13 +15,29 @@ use glam::{DVec3, IVec3, UVec3};
 use rkyv::{Archive, Deserialize, Serialize, rancor::Error};
 
 const FORMAT_MAGIC: [u8; 8] = *b"AMRCMPCT";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+
+/// An affine normalization applied to one component before it is stored.
+///
+/// Values are mapped from `[min, max]` to `[0, 1]` and clamped to that range.
+/// The calculation happens in `f64`, before compact storage converts to `f32`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactNormalization {
+    /// Plotfile component id to normalize.
+    pub component_id: u32,
+    /// Original value mapped to zero.
+    pub min: f64,
+    /// Original value mapped to one.
+    pub max: f64,
+}
 
 /// Options controlling which data are written to a compact archive.
 #[derive(Debug, Default)]
 pub struct CompactOptions {
     /// Component ids to include. Empty means all plotfile variables.
     pub component_ids: Vec<u32>,
+    /// Optional per-component normalization bounds.
+    pub normalizations: Vec<CompactNormalization>,
 }
 
 /// Result from a compaction operation
@@ -44,7 +60,9 @@ pub fn write_compact(
     let now = Instant::now();
 
     let component_ids = selected_component_ids(plot_file, &options)?;
-    let compact = CompactPlot::load(plot_file, &component_ids)?;
+    let normalizations = selected_normalizations(&component_ids, &options)?;
+    let compact =
+        CompactPlot::load_with_normalizations(plot_file, &component_ids, &normalizations)?;
 
     let compact_time = now.elapsed();
     let now = Instant::now();
@@ -161,6 +179,21 @@ pub unsafe fn read_compact_selected_unchecked(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let normalizations = archive
+        .normalizations
+        .iter()
+        .filter_map(|normalization| {
+            let component_id = normalization.component_id.to_native() as usize;
+            selected_ids
+                .contains(&component_id)
+                .then_some(CompactNormalization {
+                    component_id: component_id as u32,
+                    min: normalization.min.to_native(),
+                    max: normalization.max.to_native(),
+                })
+        })
+        .collect();
+
     Ok(CompactPlot {
         simulation_time: archive.header.simulation_time.to_native(),
         variables,
@@ -172,6 +205,7 @@ pub unsafe fn read_compact_selected_unchecked(
             .map(|ratio| ratio.to_native() as usize)
             .collect(),
         component_ids: selected_ids,
+        normalizations,
         levels,
     })
 }
@@ -313,6 +347,17 @@ impl CompactArchiveView<'_> {
             .map(|id| id.to_native() as usize)
     }
 
+    /// Normalizations stored in the archive as `(component_id, min, max)`.
+    pub fn normalizations(&self) -> impl ExactSizeIterator<Item = (usize, f64, f64)> + '_ {
+        self.archive.normalizations.iter().map(|normalization| {
+            (
+                normalization.component_id.to_native() as usize,
+                normalization.min.to_native(),
+                normalization.max.to_native(),
+            )
+        })
+    }
+
     /// Number of AMR levels stored in this archive.
     pub fn level_count(&self) -> usize {
         self.archive.levels.len()
@@ -338,6 +383,26 @@ fn validate_archive_envelope(archive: &ArchivedCompactArchive) -> Result<()> {
         "invalid compact archive coordinate system {}",
         archive.header.coordinate_system
     );
+    for (position, normalization) in archive.normalizations.iter().enumerate() {
+        let component_id = normalization.component_id.to_native();
+        ensure!(
+            archive
+                .component_ids
+                .iter()
+                .any(|stored| stored.to_native() == component_id),
+            "normalization component {component_id} is not stored in archive"
+        );
+        ensure!(
+            archive.normalizations[..position]
+                .iter()
+                .all(|previous| previous.component_id.to_native() != component_id),
+            "component {component_id} has multiple normalizations"
+        );
+        validate_normalization_bounds(
+            normalization.min.to_native(),
+            normalization.max.to_native(),
+        )?;
+    }
     Ok(())
 }
 
@@ -348,7 +413,15 @@ struct CompactArchive {
     chunk_bits: u32,
     header: ArchiveHeader,
     component_ids: Vec<u32>,
+    normalizations: Vec<ArchiveNormalization>,
     levels: Vec<ArchiveLevel>,
+}
+
+#[derive(Archive, Deserialize, Serialize)]
+struct ArchiveNormalization {
+    component_id: u32,
+    min: f64,
+    max: f64,
 }
 
 #[derive(Archive, Deserialize, Serialize)]
@@ -436,6 +509,7 @@ pub struct CompactPlot {
     pub(crate) variable_count: usize,
     pub(crate) refinement_ratios: Vec<usize>,
     pub(crate) component_ids: Vec<usize>,
+    pub(crate) normalizations: Vec<CompactNormalization>,
     pub(crate) levels: Vec<CompactLevel>,
 }
 
@@ -483,7 +557,15 @@ impl CompactPlot {
     /// `component_ids` are plotfile variable indices. At least one component is
     /// required because the first component defines active dual cubes.
     pub fn load(plot_file: &PlotFile, component_ids: &[usize]) -> Result<Self> {
-        let sparse_amr = SparseAmr::load(plot_file, component_ids)?;
+        Self::load_with_normalizations(plot_file, component_ids, &vec![None; component_ids.len()])
+    }
+
+    fn load_with_normalizations(
+        plot_file: &PlotFile,
+        component_ids: &[usize],
+        normalizations: &[Option<(f64, f64)>],
+    ) -> Result<Self> {
+        let sparse_amr = SparseAmr::load(plot_file, component_ids, normalizations)?;
         ensure!(
             sparse_amr.component_ids == component_ids,
             "sparse AMR component order changed while loading"
@@ -533,6 +615,17 @@ impl CompactPlot {
             variable_count: plot_file.variables().len(),
             refinement_ratios: plot_file.header().refinement_ratios.clone(),
             component_ids: component_ids.to_vec(),
+            normalizations: component_ids
+                .iter()
+                .zip(normalizations)
+                .filter_map(|(&component_id, &bounds)| {
+                    bounds.map(|(min, max)| CompactNormalization {
+                        component_id: component_id as u32,
+                        min,
+                        max,
+                    })
+                })
+                .collect(),
             levels,
         })
     }
@@ -555,6 +648,14 @@ impl CompactPlot {
     /// Original plotfile component ids stored in this compact plot.
     pub fn component_ids(&self) -> &[usize] {
         &self.component_ids
+    }
+
+    /// Return the original normalization bounds for a stored component.
+    pub fn component_normalization(&self, component_id: usize) -> Option<(f64, f64)> {
+        self.normalizations
+            .iter()
+            .find(|normalization| normalization.component_id as usize == component_id)
+            .map(|normalization| (normalization.min, normalization.max))
     }
 
     /// Number of AMR levels stored in this compact plot.
@@ -596,6 +697,15 @@ impl CompactArchive {
                 .into_iter()
                 .map(|id| u32::try_from(id).context("component id does not fit in u32"))
                 .collect::<Result<Vec<_>>>()?,
+            normalizations: compact
+                .normalizations
+                .into_iter()
+                .map(|normalization| ArchiveNormalization {
+                    component_id: normalization.component_id,
+                    min: normalization.min,
+                    max: normalization.max,
+                })
+                .collect(),
             levels: compact
                 .levels
                 .into_iter()
@@ -636,6 +746,30 @@ impl CompactArchive {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let mut normalizations = Vec::with_capacity(self.normalizations.len());
+        for normalization in self.normalizations {
+            let component_id = usize::try_from(normalization.component_id)
+                .context("normalization component id does not fit in usize")?;
+            ensure!(
+                component_ids.contains(&component_id),
+                "normalization component {component_id} is not stored in archive"
+            );
+            ensure!(
+                normalizations
+                    .iter()
+                    .all(|existing: &CompactNormalization| {
+                        existing.component_id != normalization.component_id
+                    }),
+                "component {component_id} has multiple normalizations"
+            );
+            validate_normalization_bounds(normalization.min, normalization.max)?;
+            normalizations.push(CompactNormalization {
+                component_id: normalization.component_id,
+                min: normalization.min,
+                max: normalization.max,
+            });
+        }
+
         let levels = self
             .levels
             .into_iter()
@@ -655,6 +789,7 @@ impl CompactArchive {
                 })
                 .collect::<Result<Vec<_>>>()?,
             component_ids,
+            normalizations,
             levels,
         })
     }
@@ -861,7 +996,7 @@ fn selected_component_ids(plot_file: &PlotFile, options: &CompactOptions) -> Res
         return Ok((0..plot_file.variables().len()).collect());
     }
 
-    options
+    let component_ids = options
         .component_ids
         .iter()
         .map(|&id| {
@@ -872,7 +1007,52 @@ fn selected_component_ids(plot_file: &PlotFile, options: &CompactOptions) -> Res
             );
             Ok(id)
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    for (position, &id) in component_ids.iter().enumerate() {
+        ensure!(
+            !component_ids[..position].contains(&id),
+            "component index {id} was selected more than once"
+        );
+    }
+    Ok(component_ids)
+}
+
+fn selected_normalizations(
+    component_ids: &[usize],
+    options: &CompactOptions,
+) -> Result<Vec<Option<(f64, f64)>>> {
+    let mut result = vec![None; component_ids.len()];
+    for normalization in &options.normalizations {
+        validate_normalization_bounds(normalization.min, normalization.max)?;
+        let component_id = usize::try_from(normalization.component_id)
+            .context("normalization component id does not fit in usize")?;
+        let slot = component_ids
+            .iter()
+            .position(|&id| id == component_id)
+            .with_context(|| {
+                format!("normalization component {component_id} is not selected for compaction")
+            })?;
+        ensure!(
+            result[slot].is_none(),
+            "component {component_id} has multiple normalizations"
+        );
+        result[slot] = Some((normalization.min, normalization.max));
+    }
+    Ok(result)
+}
+
+fn validate_normalization_bounds(min: f64, max: f64) -> Result<()> {
+    ensure!(min.is_finite(), "normalization minimum must be finite");
+    ensure!(max.is_finite(), "normalization maximum must be finite");
+    ensure!(
+        max > min,
+        "normalization maximum must be greater than minimum"
+    );
+    ensure!(
+        (max - min).is_finite(),
+        "normalization range must be finite"
+    );
+    Ok(())
 }
 
 fn uvec3_to_array(v: UVec3) -> [u32; 3] {
@@ -949,6 +1129,10 @@ mod tests {
     use super::*;
 
     fn write_single_cube_plotfile(root: &Path) -> Result<()> {
+        write_single_cube_plotfile_values(root, [0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0])
+    }
+
+    fn write_single_cube_plotfile_values(root: &Path, values: [f64; 8]) -> Result<()> {
         fs::create_dir_all(root.join("Level_0"))?;
         fs::write(
             root.join("Header"),
@@ -966,10 +1150,65 @@ mod tests {
         shard.write_all(
             b"FAB ((8, (64 11 52 0 1 12 0 1023)),(8, (8 7 6 5 4 3 2 1)))((0,0,0) (1,1,1) (0,0,0)) 1\n",
         )?;
-        for value in [0.0_f64, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0] {
+        for value in values {
             shard.write_all(&value.to_le_bytes())?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn normalizes_in_f64_before_compact_storage() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "amrex_rs_compact_normalization_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let min = 1.0e20;
+        let step = 1.0e10;
+        let max = min + 7.0 * step;
+        write_single_cube_plotfile_values(
+            &root,
+            std::array::from_fn(|index| min + index as f64 * step),
+        )?;
+
+        let result = (|| -> Result<()> {
+            let plotfile = PlotFile::open(&root)?;
+            let mut bytes = Vec::new();
+            write_compact(
+                &plotfile,
+                CompactOptions {
+                    component_ids: vec![0],
+                    normalizations: vec![CompactNormalization {
+                        component_id: 0,
+                        min,
+                        max,
+                    }],
+                },
+                &mut bytes,
+            )?;
+
+            let view = view_compact(&bytes)?;
+            ensure!(
+                view.normalizations().eq([(0, min, max)]),
+                "normalization metadata was not preserved"
+            );
+            let compact = read_compact(&bytes)?;
+            ensure!(
+                compact.component_normalization(0) == Some((min, max)),
+                "loaded compact plot lost normalization metadata"
+            );
+            let stats = compact.component_stats(0).context("missing component")?;
+            ensure!(stats.min == Some(0.0), "unexpected normalized minimum");
+            ensure!(stats.max == Some(1.0), "unexpected normalized maximum");
+            ensure!(
+                stats.value_count == 8,
+                "normalization changed the value count"
+            );
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&root);
+        result
     }
 
     #[test]
