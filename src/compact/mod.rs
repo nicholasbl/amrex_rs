@@ -73,6 +73,109 @@ pub fn read_compact(bytes: &[u8]) -> Result<CompactPlot> {
     archive.into_compact_plot()
 }
 
+/// Read only selected components from a compact archive without validating or
+/// deserializing the unused component grids.
+///
+/// The returned plot preserves the requested component order. Active-cube
+/// masks and archive metadata are still loaded for every AMR level.
+///
+/// # Safety
+///
+/// `bytes` must contain a valid, properly aligned `CompactArchive` produced for
+/// this build's rkyv format, and must remain immutable for this call. Passing
+/// malformed bytes can cause undefined behavior.
+pub unsafe fn read_compact_selected_unchecked(
+    bytes: &[u8],
+    component_ids: &[u32],
+) -> Result<CompactPlot> {
+    ensure!(
+        !component_ids.is_empty(),
+        "at least one compact component must be selected"
+    );
+    // SAFETY: The caller guarantees a valid immutable compact archive.
+    let archive = unsafe { rkyv::access_unchecked::<ArchivedCompactArchive>(bytes) };
+    validate_archive_envelope(archive)?;
+
+    let variable_count = archive.header.variables.len();
+    let mut selected_ids = Vec::with_capacity(component_ids.len());
+    let mut selected_slots = Vec::with_capacity(component_ids.len());
+    for &id in component_ids {
+        let id = usize::try_from(id).context("component id does not fit in usize")?;
+        ensure!(id < variable_count, "component index {id} is out of range");
+        ensure!(
+            !selected_ids.contains(&id),
+            "component index {id} was selected more than once"
+        );
+        let slot = archive
+            .component_ids
+            .iter()
+            .position(|archived_id| archived_id.to_native() as usize == id)
+            .with_context(|| format!("component index {id} is not stored in archive"))?;
+        selected_ids.push(id);
+        selected_slots.push(slot);
+    }
+
+    let variables = archive
+        .header
+        .variables
+        .iter()
+        .map(|variable| {
+            Ok(Variable {
+                name: variable.name.as_str().to_string(),
+                index: usize::try_from(variable.index.to_native())
+                    .context("variable index does not fit in usize")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let levels = archive
+        .levels
+        .iter()
+        .map(|level| {
+            ensure!(
+                level.components.len() == archive.component_ids.len(),
+                "archive level component count mismatch"
+            );
+            let components = selected_slots
+                .iter()
+                .map(|&slot| {
+                    rkyv::deserialize::<ArchiveF32Grid, Error>(&level.components[slot])
+                        .context("deserializing selected compact component")?
+                        .into_grid()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let active_cubes = rkyv::deserialize::<ArchiveMaskGrid, Error>(&level.active_cubes)
+                .context("deserializing compact active-cube mask")?
+                .into_grid();
+            Ok(CompactLevel {
+                level_index: usize::try_from(level.level_index.to_native())
+                    .context("level index does not fit in usize")?,
+                index_origin: IVec3::from_array(level.index_origin.map(|value| value.to_native())),
+                physical_origin: DVec3::from_array(
+                    level.physical_origin.map(|value| value.to_native()),
+                ),
+                cell_size: DVec3::from_array(level.cell_size.map(|value| value.to_native())),
+                components,
+                eligible_cubes: active_cubes,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(CompactPlot {
+        simulation_time: archive.header.simulation_time.to_native(),
+        variables,
+        variable_count,
+        refinement_ratios: archive
+            .header
+            .refinement_ratios
+            .iter()
+            .map(|ratio| ratio.to_native() as usize)
+            .collect(),
+        component_ids: selected_ids,
+        levels,
+    })
+}
+
 /// A zero-copy, read-only view of compact archive metadata.
 ///
 /// The view borrows the archive bytes and does not deserialize level grids,
@@ -891,6 +994,27 @@ mod tests {
             )?;
             ensure!(!mesh.positions.is_empty(), "expected extracted vertices");
             ensure!(!mesh.indices.is_empty(), "expected extracted faces");
+
+            // SAFETY: `bytes` were produced immediately above and remain
+            // immutable for the duration of the selective read.
+            let selected = unsafe { read_compact_selected_unchecked(&bytes, &[0])? };
+            let (selected_mesh, _) = crate::isosurface_compact(
+                &selected,
+                crate::IsosurfaceOptions {
+                    surface: crate::Surface { id: 0, value: 0.5 },
+                    sampled_quantities: Vec::new(),
+                    levels: None,
+                    flip_winding: false,
+                },
+            )?;
+            ensure!(
+                selected_mesh.positions == mesh.positions,
+                "selective read changed extracted vertices"
+            );
+            ensure!(
+                selected_mesh.indices == mesh.indices,
+                "selective read changed extracted faces"
+            );
             Ok(())
         })();
 

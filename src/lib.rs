@@ -12,8 +12,8 @@ pub(crate) mod sparse_amr;
 pub mod utility;
 
 pub use compact::{
-    CompactArchiveView, CompactOptions, CompactPlot, read_compact, view_compact,
-    view_compact_unchecked, write_compact,
+    CompactArchiveView, CompactOptions, CompactPlot, read_compact, read_compact_selected_unchecked,
+    view_compact, view_compact_unchecked, write_compact,
 };
 pub use isosurface::{
     DedupMeshOptions, IsosurfaceOptions, Mesh3D, RemoveDegenerateTrianglesOptions, Sample, Surface,
