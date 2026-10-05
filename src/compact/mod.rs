@@ -367,7 +367,8 @@ impl CompactArchiveView<'_> {
 fn validate_archive_envelope(archive: &ArchivedCompactArchive) -> Result<()> {
     ensure!(
         archive.magic == FORMAT_MAGIC,
-        "invalid compact archive magic"
+        "invalid compact archive magic {:?}",
+        archive.magic
     );
     ensure!(
         archive.version == FORMAT_VERSION,
