@@ -123,8 +123,7 @@ println!(
     result.decimation.final_face_count
 );
 println!(
-    "dedup {:?}, degenerates {:?}, pre-compact {:?}, decimate {:?}, total {:?}",
-    result.timings.deduplication,
+    "degenerates {:?}, pre-compact {:?}, decimate {:?}, total {:?}",
     result.timings.degenerate_removal,
     result.timings.pre_decimation_compaction,
     result.timings.decimation,
@@ -141,8 +140,11 @@ println!(
 );
 ```
 
-Use `decimate_mesh` directly when the mesh is already welded and free of
-degenerate triangles. Error limits can be relative to mesh extent or absolute
+MC33 vertices shared by parallel extraction chunks are welded exactly from
+their grid edge/cell keys while each level is merged. The decimation pipeline
+therefore starts with degenerate-face removal and vertex compaction; it does not
+perform approximate geometric welding. Use `decimate_mesh` directly when the
+mesh is already clean. Error limits can be relative to mesh extent or absolute
 in the physical units used by `Mesh3D::positions`.
 
 Large meshes use a topology-aware parallel path by default. Meshlets seed

@@ -25,8 +25,8 @@ pub use decimate::{
     DecimateTimings, decimate_mesh, decimate_mesh_pipeline,
 };
 pub use isosurface::{
-    DedupMeshOptions, IsosurfaceOptions, Mesh3D, RemoveDegenerateTrianglesOptions, Sample, Surface,
-    dedup_mesh_vertices, isosurface, isosurface_compact, remove_degenerate_triangles,
+    IsosurfaceOptions, Mesh3D, RemoveDegenerateTrianglesOptions, Sample, Surface, isosurface,
+    isosurface_compact, remove_degenerate_triangles,
 };
 pub use slice::{SliceAxis, SliceOptions, SlicePlane, slice, slice_compact};
 

@@ -142,16 +142,19 @@ fn mc33_extracts_a_plane_without_tetrahedral_diagonals() {
     let level = level_with_grids(&samples, Vec::new(), &active_cubes);
 
     let mut mesh = Mesh3D::default();
+    let mut vertex_keys = Vec::new();
     mesh_level_mc33_aabb(
         &level,
         level.active_cubes.bounds_aabb(),
         &[],
         0.5,
         &mut mesh,
+        &mut vertex_keys,
     )
     .unwrap();
 
     assert_eq!(mesh.positions.len(), 4);
+    assert_eq!(vertex_keys.len(), mesh.positions.len());
     assert_eq!(mesh.uv.len(), 4);
     assert_eq!(mesh.indices.len(), 2);
     assert!(
@@ -168,16 +171,14 @@ fn mc33_extracts_a_plane_without_tetrahedral_diagonals() {
 
 #[test]
 fn public_mesher_extracts_across_active_chunks() -> Result<()> {
-    let mut samples = SparseGrid3::new(UVec3::new(34, 2, 2));
+    let mut samples = SparseGrid3::new(UVec3::new(2, 34, 2));
     samples.fill_aabb(samples.bounds_aabb(), 0.0);
     for z in 0..2 {
-        for y in 0..2 {
-            for x in 17..34 {
-                samples.set(UVec3::new(x, y, z), 1.0);
-            }
+        for y in 0..34 {
+            samples.set(UVec3::new(1, y, z), 1.0);
         }
     }
-    let mut active_cubes = SparseGrid3::new(UVec3::new(33, 1, 1));
+    let mut active_cubes = SparseGrid3::new(UVec3::new(1, 33, 1));
     active_cubes.fill_aabb(active_cubes.bounds_aabb(), ());
     let scalar_samples = CompactScalarGrid::F32(samples.clone());
     let level = level_with_grids(&scalar_samples, Vec::new(), &active_cubes);
@@ -212,8 +213,11 @@ fn public_mesher_extracts_across_active_chunks() -> Result<()> {
         },
     )?;
 
-    ensure!(!mesh.positions.is_empty(), "expected extracted vertices");
-    ensure!(!mesh.indices.is_empty(), "expected extracted faces");
+    ensure!(
+        mesh.positions.len() == 68,
+        "shared MC33 edge keys were not welded across chunks"
+    );
+    ensure!(mesh.indices.len() == 66, "unexpected plane face count");
     Ok(())
 }
 
@@ -336,76 +340,6 @@ fn public_mesher_flip_winding_inverts_lower_quantity_front_face() -> Result<()> 
     );
 
     Ok(())
-}
-
-#[test]
-fn dedup_mesh_vertices_merges_by_position_and_uv_thresholds() -> Result<()> {
-    let mut mesh = Mesh3D {
-        positions: vec![
-            [0.0, 0.0, 0.0],
-            [0.0005, 0.0, 0.0],
-            [0.0005, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-        ],
-        uv: vec![[0.25, 0.5], [0.2504, 0.5], [0.9, 0.5], [1.0, 0.0]],
-        indices: vec![[0, 1, 3], [0, 2, 3]],
-    };
-
-    let removed = dedup_mesh_vertices(
-        &mut mesh,
-        DedupMeshOptions {
-            position_epsilon: 0.001,
-            uv_epsilon: 0.001,
-        },
-    )?;
-
-    assert_eq!(removed, 1);
-    assert_eq!(mesh.positions.len(), 3);
-    assert_eq!(mesh.uv.len(), 3);
-    assert_eq!(mesh.indices, vec![[0, 0, 2], [0, 1, 2]]);
-    Ok(())
-}
-
-#[test]
-fn dedup_mesh_vertices_supports_position_only_meshes() -> Result<()> {
-    let mut mesh = Mesh3D {
-        positions: vec![[0.0, 0.0, 0.0], [0.0005, 0.0, 0.0], [1.0, 0.0, 0.0]],
-        uv: Vec::new(),
-        indices: vec![[0, 1, 2]],
-    };
-
-    let removed = dedup_mesh_vertices(
-        &mut mesh,
-        DedupMeshOptions {
-            position_epsilon: 0.001,
-            uv_epsilon: 0.001,
-        },
-    )?;
-
-    assert_eq!(removed, 1);
-    assert!(mesh.uv.is_empty());
-    assert_eq!(mesh.indices, vec![[0, 0, 1]]);
-    Ok(())
-}
-
-#[test]
-fn dedup_mesh_vertices_rejects_partial_uv_buffer() {
-    let mut mesh = Mesh3D {
-        positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-        uv: vec![[0.0, 0.0]],
-        indices: Vec::new(),
-    };
-
-    assert!(
-        dedup_mesh_vertices(
-            &mut mesh,
-            DedupMeshOptions {
-                position_epsilon: 0.001,
-                uv_epsilon: 0.001,
-            },
-        )
-        .is_err()
-    );
 }
 
 #[test]

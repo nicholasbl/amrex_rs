@@ -12,10 +12,7 @@ use anyhow::{Context, Result, ensure};
 use meshopt::{SimplifyOptions, VertexDataAdapter};
 use rayon::prelude::*;
 
-use crate::{
-    DedupMeshOptions, Mesh3D, RemoveDegenerateTrianglesOptions, dedup_mesh_vertices,
-    remove_degenerate_triangles,
-};
+use crate::{Mesh3D, RemoveDegenerateTrianglesOptions, remove_degenerate_triangles};
 
 /// Desired final mesh size.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -158,12 +155,10 @@ pub struct DecimateTimings {
     pub total: Duration,
 }
 
-/// Options for welding, cleaning, and decimating a mesh in one call.
+/// Options for cleaning and decimating a mesh in one call.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecimatePipelineOptions {
-    /// Tolerances used to weld vertices before simplification.
-    pub dedup: DedupMeshOptions,
-    /// Threshold used to discard degenerate faces after welding.
+    /// Threshold used to discard degenerate faces before simplification.
     pub remove_degenerate: RemoveDegenerateTrianglesOptions,
     /// Options passed to the decimation stage.
     pub decimate: DecimateOptions,
@@ -172,10 +167,6 @@ pub struct DecimatePipelineOptions {
 impl Default for DecimatePipelineOptions {
     fn default() -> Self {
         Self {
-            dedup: DedupMeshOptions {
-                position_epsilon: 1e-6,
-                uv_epsilon: 1e-6,
-            },
             remove_degenerate: RemoveDegenerateTrianglesOptions { area_epsilon: 0.0 },
             decimate: DecimateOptions::default(),
         }
@@ -189,9 +180,7 @@ pub struct DecimatePipelineResult {
     pub original_face_count: usize,
     /// Vertex count before any cleanup.
     pub original_vertex_count: usize,
-    /// Number of vertices removed by welding.
-    pub removed_duplicate_vertices: usize,
-    /// Number of faces removed after welding because they were degenerate.
+    /// Number of degenerate faces removed before decimation.
     pub removed_degenerate_faces: usize,
     /// Number of unreferenced vertices removed before decimation.
     pub removed_unreferenced_vertices: usize,
@@ -204,8 +193,6 @@ pub struct DecimatePipelineResult {
 /// Stage timings for [`decimate_mesh_pipeline`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecimatePipelineTimings {
-    /// Approximate vertex welding by position and UV.
-    pub deduplication: Duration,
     /// Removal of repeated-index and small-area triangles.
     pub degenerate_removal: Duration,
     /// Removal and remapping of unreferenced vertices before decimation.
@@ -748,11 +735,10 @@ fn meshlet_faces(meshlets: &meshopt::Meshlets) -> Vec<[u32; 3]> {
     faces
 }
 
-/// Weld, clean, and decimate an indexed triangle mesh in place.
+/// Clean and decimate an indexed triangle mesh in place.
 ///
-/// The pipeline performs vertex deduplication, removes degenerate triangles,
-/// removes vertices no longer referenced by a triangle, and finally decimates
-/// and compacts the mesh.
+/// The pipeline removes degenerate triangles, removes vertices no longer
+/// referenced by a triangle, and finally decimates and compacts the mesh.
 pub fn decimate_mesh_pipeline(
     mesh: &mut Mesh3D,
     options: DecimatePipelineOptions,
@@ -760,11 +746,6 @@ pub fn decimate_mesh_pipeline(
     let total_start = Instant::now();
     let original_face_count = mesh.indices.len();
     let original_vertex_count = mesh.positions.len();
-
-    let stage_start = Instant::now();
-    let removed_duplicate_vertices =
-        dedup_mesh_vertices(mesh, options.dedup).context("deduplicating mesh before decimation")?;
-    let deduplication = stage_start.elapsed();
 
     let stage_start = Instant::now();
     let removed_degenerate_faces = remove_degenerate_triangles(mesh, options.remove_degenerate)
@@ -782,12 +763,10 @@ pub fn decimate_mesh_pipeline(
     Ok(DecimatePipelineResult {
         original_face_count,
         original_vertex_count,
-        removed_duplicate_vertices,
         removed_degenerate_faces,
         removed_unreferenced_vertices,
         decimation,
         timings: DecimatePipelineTimings {
-            deduplication,
             degenerate_removal,
             pre_decimation_compaction,
             decimation: decimation_time,
@@ -1056,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_welds_and_removes_degenerate_faces() -> Result<()> {
+    fn pipeline_removes_degenerate_faces_and_unreferenced_vertices() -> Result<()> {
         let mut mesh = Mesh3D {
             positions: vec![
                 [0.0, 0.0, 0.0],
@@ -1071,10 +1050,6 @@ mod tests {
         let result = decimate_mesh_pipeline(
             &mut mesh,
             DecimatePipelineOptions {
-                dedup: DedupMeshOptions {
-                    position_epsilon: 1e-6,
-                    uv_epsilon: 1e-6,
-                },
                 remove_degenerate: RemoveDegenerateTrianglesOptions { area_epsilon: 0.0 },
                 decimate: DecimateOptions {
                     target: DecimateTarget::FaceCount(1),
@@ -1085,9 +1060,8 @@ mod tests {
 
         ensure!(result.original_face_count == 2);
         ensure!(result.original_vertex_count == 4);
-        ensure!(result.removed_duplicate_vertices == 1);
         ensure!(result.removed_degenerate_faces == 1);
-        ensure!(result.timings.total >= result.timings.deduplication);
+        ensure!(result.removed_unreferenced_vertices == 1);
         ensure!(result.timings.total >= result.timings.degenerate_removal);
         ensure!(result.timings.total >= result.timings.pre_decimation_compaction);
         ensure!(result.timings.total >= result.timings.decimation);

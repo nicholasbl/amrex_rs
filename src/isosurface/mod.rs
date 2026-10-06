@@ -63,17 +63,6 @@ pub struct Mesh3D {
     pub indices: Vec<[u32; 3]>,
 }
 
-/// Thresholds used when merging duplicate mesh vertices.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DedupMeshOptions {
-    /// Maximum Euclidean distance between positions for vertices to merge.
-    pub position_epsilon: f32,
-    /// Maximum Euclidean distance between UVs for vertices to merge.
-    ///
-    /// This is ignored when `mesh.uv` is empty.
-    pub uv_epsilon: f32,
-}
-
 /// Options controlling removal of degenerate triangles.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RemoveDegenerateTrianglesOptions {
@@ -83,104 +72,6 @@ pub struct RemoveDegenerateTrianglesOptions {
     /// less than or equal to this threshold are removed after validating their
     /// indices and positions.
     pub area_epsilon: f32,
-}
-
-/// Merge vertices whose positions and UVs are within the configured thresholds.
-///
-/// The operation is in-place and returns the number of removed vertices. Meshes
-/// with an empty UV buffer are deduplicated by position only. Meshes with a
-/// non-empty UV buffer must have one UV per position.
-pub fn dedup_mesh_vertices(mesh: &mut Mesh3D, options: DedupMeshOptions) -> Result<usize> {
-    ensure!(
-        options.position_epsilon.is_finite() && options.position_epsilon > 0.0,
-        "position_epsilon must be finite and positive"
-    );
-    ensure!(
-        options.uv_epsilon.is_finite() && options.uv_epsilon > 0.0,
-        "uv_epsilon must be finite and positive"
-    );
-    ensure!(
-        mesh.uv.is_empty() || mesh.uv.len() == mesh.positions.len(),
-        "mesh uv buffer must be empty or match position count"
-    );
-
-    if mesh.positions.is_empty() {
-        return Ok(0);
-    }
-
-    let use_uv = !mesh.uv.is_empty();
-    let mut remap = vec![0u32; mesh.positions.len()];
-    let mut positions = Vec::with_capacity(mesh.positions.len());
-    let mut uv = Vec::with_capacity(mesh.uv.len());
-    let mut buckets: HashMap<[i64; 5], Vec<u32>> = HashMap::new();
-    let position_epsilon_squared = options.position_epsilon * options.position_epsilon;
-    let uv_epsilon_squared = options.uv_epsilon * options.uv_epsilon;
-
-    for (old_index, &position) in mesh.positions.iter().enumerate() {
-        let old_uv = use_uv.then(|| mesh.uv[old_index]);
-        ensure!(
-            position.iter().all(|component| component.is_finite()),
-            "mesh position {old_index} contains a non-finite component"
-        );
-        ensure!(
-            old_uv.is_none_or(|uv| uv.iter().all(|component| component.is_finite())),
-            "mesh uv {old_index} contains a non-finite component"
-        );
-        let key = dedup_bucket_key(position, old_uv, options);
-        let mut merged = None;
-
-        visit_neighboring_dedup_keys(key, use_uv, |neighbor_key| {
-            let Some(candidates) = buckets.get(&neighbor_key) else {
-                return true;
-            };
-            for &candidate in candidates {
-                let candidate_index = candidate as usize;
-                if position_distance_squared(position, positions[candidate_index])
-                    <= position_epsilon_squared
-                    && (!use_uv
-                        || uv_distance_squared(old_uv.unwrap(), uv[candidate_index])
-                            <= uv_epsilon_squared)
-                {
-                    merged = Some(candidate);
-                    return false;
-                }
-            }
-            true
-        });
-
-        let new_index = match merged {
-            Some(index) => index,
-            None => {
-                let index =
-                    u32::try_from(positions.len()).context("mesh vertex count exceeds u32")?;
-                positions.push(position);
-                if let Some(uv_value) = old_uv {
-                    uv.push(uv_value);
-                }
-                buckets.entry(key).or_default().push(index);
-                index
-            }
-        };
-        remap[old_index] = new_index;
-    }
-
-    mesh.indices
-        .par_iter_mut()
-        .try_for_each(|face| -> Result<()> {
-            for index in face {
-                let old_index =
-                    usize::try_from(*index).context("mesh index does not fit in usize")?;
-                *index = *remap
-                    .get(old_index)
-                    .with_context(|| format!("mesh index {old_index} is out of bounds"))?;
-            }
-            Ok(())
-        })?;
-
-    let removed = mesh.positions.len() - positions.len();
-    mesh.positions = positions;
-    mesh.uv = uv;
-    Ok(removed)
 }
 
 /// Remove triangles with repeated indices or near-zero physical area.
@@ -216,67 +107,6 @@ pub fn remove_degenerate_triangles(
     Ok(removed)
 }
 
-fn dedup_bucket_key(
-    position: [f32; 3],
-    uv: Option<[f32; 2]>,
-    options: DedupMeshOptions,
-) -> [i64; 5] {
-    let uv = uv.unwrap_or([0.0, 0.0]);
-    [
-        bucket_coord(position[0], options.position_epsilon),
-        bucket_coord(position[1], options.position_epsilon),
-        bucket_coord(position[2], options.position_epsilon),
-        bucket_coord(uv[0], options.uv_epsilon),
-        bucket_coord(uv[1], options.uv_epsilon),
-    ]
-}
-
-fn bucket_coord(value: f32, epsilon: f32) -> i64 {
-    (value / epsilon).floor() as i64
-}
-
-fn visit_neighboring_dedup_keys<F>(key: [i64; 5], use_uv: bool, mut visitor: F)
-where
-    F: FnMut([i64; 5]) -> bool,
-{
-    for dz in -1..=1 {
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                if use_uv {
-                    for dv in -1..=1 {
-                        for du in -1..=1 {
-                            if !visitor([
-                                key[0] + dx,
-                                key[1] + dy,
-                                key[2] + dz,
-                                key[3] + du,
-                                key[4] + dv,
-                            ]) {
-                                return;
-                            }
-                        }
-                    }
-                } else if !visitor([key[0] + dx, key[1] + dy, key[2] + dz, key[3], key[4]]) {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-fn position_distance_squared(a: [f32; 3], b: [f32; 3]) -> f32 {
-    let dx = a[0] - b[0];
-    let dy = a[1] - b[1];
-    let dz = a[2] - b[2];
-    dx.mul_add(dx, dy.mul_add(dy, dz * dz))
-}
-
-fn uv_distance_squared(a: [f32; 2], b: [f32; 2]) -> f32 {
-    let du = a[0] - b[0];
-    let dv = a[1] - b[1];
-    du.mul_add(du, dv * dv)
-}
-
 fn has_repeated_index(face: [u32; 3]) -> bool {
     face[0] == face[1] || face[0] == face[2] || face[1] == face[2]
 }
@@ -306,7 +136,7 @@ fn triangle_area_squared(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
         ab[2].mul_add(ac[0], -ab[0] * ac[2]),
         ab[0].mul_add(ac[1], -ab[1] * ac[0]),
     ];
-    0.25 * position_distance_squared(cross, [0.0, 0.0, 0.0])
+    0.25 * cross[0].mul_add(cross[0], cross[1].mul_add(cross[1], cross[2] * cross[2]))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -514,17 +344,76 @@ fn mesh_level_parallel(
         .into_par_iter()
         .map(|active_aabb| {
             let mut mesh = Mesh3D::default();
-            mc33::mesh_level_aabb(level, active_aabb, ranges, isovalue, &mut mesh)?;
-            Ok((active_aabb, mesh))
+            let mut vertex_keys = Vec::new();
+            mc33::mesh_level_aabb(
+                level,
+                active_aabb,
+                ranges,
+                isovalue,
+                &mut mesh,
+                &mut vertex_keys,
+            )?;
+            Ok((active_aabb, mesh, vertex_keys))
         })
         .collect::<Result<Vec<_>>>()?;
-    chunks.sort_by_key(|(aabb, _)| chunk_sort_key(*aabb));
+    chunks.sort_by_key(|(aabb, _, _)| chunk_sort_key(*aabb));
 
     let mut mesh = Mesh3D::default();
-    for (_, chunk_mesh) in chunks {
-        merge_mesh(&mut mesh, chunk_mesh)?;
+    let vertex_capacity = chunks.iter().map(|(_, mesh, _)| mesh.positions.len()).sum();
+    let face_capacity = chunks.iter().map(|(_, mesh, _)| mesh.indices.len()).sum();
+    mesh.positions.reserve(vertex_capacity);
+    mesh.uv.reserve(vertex_capacity);
+    mesh.indices.reserve(face_capacity);
+    let mut vertex_ids = HashMap::with_capacity(vertex_capacity);
+    for (_, chunk_mesh, vertex_keys) in chunks {
+        merge_keyed_mesh(&mut mesh, chunk_mesh, vertex_keys, &mut vertex_ids)?;
     }
     Ok(mesh)
+}
+
+fn merge_keyed_mesh(
+    dest: &mut Mesh3D,
+    src: Mesh3D,
+    vertex_keys: Vec<mc33::VertexKey>,
+    vertex_ids: &mut HashMap<mc33::VertexKey, u32>,
+) -> Result<()> {
+    ensure!(
+        src.positions.len() == src.uv.len() && src.positions.len() == vertex_keys.len(),
+        "keyed mesh vertex buffers have different lengths"
+    );
+
+    let mut remap = Vec::with_capacity(src.positions.len());
+    for ((key, position), uv) in vertex_keys.into_iter().zip(src.positions).zip(src.uv) {
+        let index = match vertex_ids.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let index = *entry.get();
+                let index_usize = index as usize;
+                ensure!(
+                    dest.positions[index_usize] == position && dest.uv[index_usize] == uv,
+                    "MC33 vertex key produced inconsistent vertex data across chunks"
+                );
+                index
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let index =
+                    u32::try_from(dest.positions.len()).context("mesh vertex count exceeds u32")?;
+                dest.positions.push(position);
+                dest.uv.push(uv);
+                entry.insert(index);
+                index
+            }
+        };
+        remap.push(index);
+    }
+
+    for (face_index, face) in src.indices.into_iter().enumerate() {
+        let remapped = face.map(|index| remap.get(index as usize).copied());
+        let [Some(a), Some(b), Some(c)] = remapped else {
+            anyhow::bail!("chunk face {face_index} references an invalid vertex");
+        };
+        dest.indices.push([a, b, c]);
+    }
+    Ok(())
 }
 
 fn merge_mesh(dest: &mut Mesh3D, src: Mesh3D) -> Result<()> {

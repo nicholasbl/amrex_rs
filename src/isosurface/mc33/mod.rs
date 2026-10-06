@@ -48,7 +48,7 @@ const EDGE_CORNERS: [[usize; 2]; 12] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum VertexKey {
+pub(super) enum VertexKey {
     Edge(UVec3, UVec3),
     Interior(UVec3),
 }
@@ -96,6 +96,7 @@ struct Mc33Mesher<'a> {
     ranges: &'a [SampleRange],
     isovalue: f64,
     mesh: &'a mut Mesh3D,
+    vertex_keys: &'a mut Vec<VertexKey>,
     vertex_ids: HashMap<VertexKey, u32>,
     face_ids: HashSet<[u32; 3]>,
 }
@@ -202,6 +203,7 @@ impl Mc33Mesher<'_> {
             u32::try_from(self.mesh.positions.len()).context("mesh vertex count exceeds u32")?;
         self.mesh.positions.push(position.to_array());
         self.mesh.uv.push(sampled_values_to_uv(sampled_values));
+        self.vertex_keys.push(key);
         self.vertex_ids.insert(key, id);
         Ok(id)
     }
@@ -260,6 +262,7 @@ pub(super) fn mesh_level_aabb(
     ranges: &[SampleRange],
     isovalue: f64,
     mesh: &mut Mesh3D,
+    vertex_keys: &mut Vec<VertexKey>,
 ) -> Result<()> {
     let mut mesher = Mc33Mesher {
         level,
@@ -272,6 +275,7 @@ pub(super) fn mesh_level_aabb(
         ranges,
         isovalue,
         mesh,
+        vertex_keys,
         vertex_ids: HashMap::new(),
         face_ids: HashSet::new(),
     };
