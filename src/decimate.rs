@@ -3,7 +3,10 @@
 //! This module keeps the native meshoptimizer interface private and exposes
 //! operations directly on [`Mesh3D`].
 
-use std::{mem, ptr};
+use std::{
+    mem, ptr,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, ensure};
 use meshopt::SimplifyOptions;
@@ -81,6 +84,27 @@ pub struct DecimateResult {
     pub error: f32,
     /// True when the requested face count was reached.
     pub reached_target: bool,
+    /// Time spent in each stage of this decimation call.
+    pub timings: DecimateTimings,
+}
+
+/// Stage timings for [`decimate_mesh`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecimateTimings {
+    /// Validation of the input mesh and decimation options.
+    pub input_validation: Duration,
+    /// The meshoptimizer simplification call and result-size checks.
+    ///
+    /// This is zero when the input is empty or already meets the target.
+    pub simplification: Duration,
+    /// Validation of meshoptimizer's output.
+    ///
+    /// This is zero when meshoptimizer was not called.
+    pub output_validation: Duration,
+    /// Removal and remapping of unreferenced vertices after simplification.
+    pub compaction: Duration,
+    /// Wall-clock duration of the complete decimation call.
+    pub total: Duration,
 }
 
 /// Options for welding, cleaning, and decimating a mesh in one call.
@@ -122,6 +146,23 @@ pub struct DecimatePipelineResult {
     pub removed_unreferenced_vertices: usize,
     /// Result of the final decimation stage.
     pub decimation: DecimateResult,
+    /// Time spent in each stage of the complete pipeline.
+    pub timings: DecimatePipelineTimings,
+}
+
+/// Stage timings for [`decimate_mesh_pipeline`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecimatePipelineTimings {
+    /// Approximate vertex welding by position and UV.
+    pub deduplication: Duration,
+    /// Removal of repeated-index and small-area triangles.
+    pub degenerate_removal: Duration,
+    /// Removal and remapping of unreferenced vertices before decimation.
+    pub pre_decimation_compaction: Duration,
+    /// The complete [`decimate_mesh`] call.
+    pub decimation: Duration,
+    /// Wall-clock duration of the complete cleanup and decimation pipeline.
+    pub total: Duration,
 }
 
 /// Decimate an indexed triangle mesh in place.
@@ -131,13 +172,18 @@ pub struct DecimatePipelineResult {
 /// after simplification, and UV values are updated alongside positions when
 /// their corresponding weight is nonzero.
 pub fn decimate_mesh(mesh: &mut Mesh3D, options: DecimateOptions) -> Result<DecimateResult> {
+    let total_start = Instant::now();
+    let stage_start = Instant::now();
     validate_mesh(mesh)?;
     validate_options(options)?;
+    let input_validation = stage_start.elapsed();
 
     let original_face_count = mesh.indices.len();
     let original_vertex_count = mesh.positions.len();
     if original_face_count == 0 {
+        let stage_start = Instant::now();
         compact_vertices(mesh)?;
+        let compaction = stage_start.elapsed();
         let final_vertex_count = mesh.positions.len();
         return Ok(DecimateResult {
             original_face_count,
@@ -146,12 +192,20 @@ pub fn decimate_mesh(mesh: &mut Mesh3D, options: DecimateOptions) -> Result<Deci
             final_vertex_count,
             error: 0.0,
             reached_target: true,
+            timings: DecimateTimings {
+                input_validation,
+                compaction,
+                total: total_start.elapsed(),
+                ..DecimateTimings::default()
+            },
         });
     }
 
     let target_face_count = resolve_target(options.target, original_face_count)?;
     if target_face_count >= original_face_count {
+        let stage_start = Instant::now();
         compact_vertices(mesh)?;
+        let compaction = stage_start.elapsed();
         return Ok(DecimateResult {
             original_face_count,
             final_face_count: original_face_count,
@@ -159,6 +213,12 @@ pub fn decimate_mesh(mesh: &mut Mesh3D, options: DecimateOptions) -> Result<Deci
             final_vertex_count: mesh.positions.len(),
             error: 0.0,
             reached_target: true,
+            timings: DecimateTimings {
+                input_validation,
+                compaction,
+                total: total_start.elapsed(),
+                ..DecimateTimings::default()
+            },
         });
     }
 
@@ -196,6 +256,7 @@ pub fn decimate_mesh(mesh: &mut Mesh3D, options: DecimateOptions) -> Result<Deci
     // `[u32; 3]`, `[f32; 3]`, and `[f32; 2]` are contiguous, and all pointers
     // remain valid for the duration of this call. Counts and strides exactly
     // match their respective buffers. The optional lock pointer is null.
+    let stage_start = Instant::now();
     let simplified_index_count = unsafe {
         meshopt::ffi::meshopt_simplifyWithUpdate(
             mesh.indices.as_mut_ptr().cast::<u32>(),
@@ -220,8 +281,15 @@ pub fn decimate_mesh(mesh: &mut Mesh3D, options: DecimateOptions) -> Result<Deci
         "meshoptimizer returned an invalid index count {simplified_index_count}"
     );
     mesh.indices.truncate(simplified_index_count / 3);
+    let simplification = stage_start.elapsed();
+
+    let stage_start = Instant::now();
     validate_mesh(mesh).context("validating meshoptimizer output")?;
+    let output_validation = stage_start.elapsed();
+
+    let stage_start = Instant::now();
     compact_vertices(mesh)?;
+    let compaction = stage_start.elapsed();
 
     let final_face_count = mesh.indices.len();
     Ok(DecimateResult {
@@ -231,6 +299,13 @@ pub fn decimate_mesh(mesh: &mut Mesh3D, options: DecimateOptions) -> Result<Deci
         final_vertex_count: mesh.positions.len(),
         error: result_error,
         reached_target: final_face_count <= target_face_count,
+        timings: DecimateTimings {
+            input_validation,
+            simplification,
+            output_validation,
+            compaction,
+            total: total_start.elapsed(),
+        },
     })
 }
 
@@ -243,14 +318,27 @@ pub fn decimate_mesh_pipeline(
     mesh: &mut Mesh3D,
     options: DecimatePipelineOptions,
 ) -> Result<DecimatePipelineResult> {
+    let total_start = Instant::now();
     let original_face_count = mesh.indices.len();
     let original_vertex_count = mesh.positions.len();
+
+    let stage_start = Instant::now();
     let removed_duplicate_vertices =
         dedup_mesh_vertices(mesh, options.dedup).context("deduplicating mesh before decimation")?;
+    let deduplication = stage_start.elapsed();
+
+    let stage_start = Instant::now();
     let removed_degenerate_faces = remove_degenerate_triangles(mesh, options.remove_degenerate)
         .context("removing degenerate triangles before decimation")?;
+    let degenerate_removal = stage_start.elapsed();
+
+    let stage_start = Instant::now();
     let removed_unreferenced_vertices = compact_vertices(mesh)?;
+    let pre_decimation_compaction = stage_start.elapsed();
+
+    let stage_start = Instant::now();
     let decimation = decimate_mesh(mesh, options.decimate)?;
+    let decimation_time = stage_start.elapsed();
 
     Ok(DecimatePipelineResult {
         original_face_count,
@@ -259,6 +347,13 @@ pub fn decimate_mesh_pipeline(
         removed_degenerate_faces,
         removed_unreferenced_vertices,
         decimation,
+        timings: DecimatePipelineTimings {
+            deduplication,
+            degenerate_removal,
+            pre_decimation_compaction,
+            decimation: decimation_time,
+            total: total_start.elapsed(),
+        },
     })
 }
 
@@ -416,6 +511,10 @@ mod tests {
 
         ensure!(result.final_face_count < result.original_face_count);
         ensure!(result.final_vertex_count <= result.original_vertex_count);
+        ensure!(result.timings.total >= result.timings.input_validation);
+        ensure!(result.timings.total >= result.timings.simplification);
+        ensure!(result.timings.total >= result.timings.output_validation);
+        ensure!(result.timings.total >= result.timings.compaction);
         ensure!(mesh.uv.len() == mesh.positions.len());
         ensure!(mesh.indices.iter().flatten().all(|&index| {
             usize::try_from(index).is_ok_and(|index| index < mesh.positions.len())
@@ -455,6 +554,11 @@ mod tests {
         ensure!(result.original_vertex_count == 4);
         ensure!(result.removed_duplicate_vertices == 1);
         ensure!(result.removed_degenerate_faces == 1);
+        ensure!(result.timings.total >= result.timings.deduplication);
+        ensure!(result.timings.total >= result.timings.degenerate_removal);
+        ensure!(result.timings.total >= result.timings.pre_decimation_compaction);
+        ensure!(result.timings.total >= result.timings.decimation);
+        ensure!(result.timings.decimation >= result.decimation.timings.total);
         ensure!(mesh.positions.len() == 3);
         ensure!(mesh.indices == vec![[0, 1, 2]]);
         Ok(())
@@ -492,6 +596,8 @@ mod tests {
         ensure!(mesh.uv.is_empty());
         ensure!(result.original_vertex_count == 1);
         ensure!(result.final_vertex_count == 0);
+        ensure!(result.timings.simplification == Duration::ZERO);
+        ensure!(result.timings.output_validation == Duration::ZERO);
         Ok(())
     }
 }

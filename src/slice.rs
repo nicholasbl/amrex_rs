@@ -7,10 +7,10 @@ use anyhow::{Context, Result, ensure};
 use glam::{DVec3, I64Vec3, IVec3, UVec3};
 
 use crate::PlotFile;
-use crate::compact::CompactPlot;
+use crate::compact::{CompactPlot, CompactScalarAccessor, CompactScalarGrid};
 use crate::isosurface::{Mesh3D, Sample};
 use crate::sparse_amr::level_translation;
-use crate::utility::{GridAccessor, SparseGrid3};
+use crate::utility::SparseGrid3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SliceAxis {
@@ -56,7 +56,7 @@ struct SliceLevel<'a> {
     index_origin: IVec3,
     physical_origin: DVec3,
     cell_size: DVec3,
-    sampled_quantities: Vec<&'a SparseGrid3<f32>>,
+    sampled_quantities: Vec<&'a CompactScalarGrid>,
     active_cells: SparseGrid3<()>,
 }
 
@@ -206,7 +206,7 @@ fn slice_levels_from_compact<'a>(
 }
 
 fn build_slice_active_cells(
-    samples: &SparseGrid3<f32>,
+    samples: &CompactScalarGrid,
     level: &crate::compact::CompactLevel,
     plane: SlicePlane,
 ) -> Result<SparseGrid3<()>> {
@@ -221,7 +221,7 @@ fn build_slice_active_cells(
     };
     let axis = axis_index(plane.axis);
     let mut active = SparseGrid3::with_chunk_capacity(samples.bounds(), samples.chunk_count());
-    samples.for_each_present_in_aabb(samples.bounds_aabb(), |cell, _| {
+    samples.for_each_value_in_aabb(samples.bounds_aabb(), |cell, _| {
         if component(cell, axis) == axis_cell {
             active.set(cell, ());
         }
@@ -295,7 +295,7 @@ fn plane_cell(
 fn emit_quad(
     mesh: &mut Mesh3D,
     vertex_ids: &mut HashMap<(UVec3, UVec3), u32>,
-    accessors: &mut [GridAccessor<'_, f32>],
+    accessors: &mut [CompactScalarAccessor<'_>],
     ranges: &[SampleRange],
     level: &SliceLevel<'_>,
     plane: SlicePlane,
@@ -322,7 +322,7 @@ fn emit_quad(
 fn vertex(
     mesh: &mut Mesh3D,
     vertex_ids: &mut HashMap<(UVec3, UVec3), u32>,
-    accessors: &mut [GridAccessor<'_, f32>],
+    accessors: &mut [CompactScalarAccessor<'_>],
     ranges: &[SampleRange],
     level: &SliceLevel<'_>,
     plane: SlicePlane,
@@ -344,7 +344,7 @@ fn vertex(
 }
 
 fn sample_uv(
-    accessors: &mut [GridAccessor<'_, f32>],
+    accessors: &mut [CompactScalarAccessor<'_>],
     ranges: &[SampleRange],
     level: &SliceLevel<'_>,
     plane: SlicePlane,
@@ -375,7 +375,7 @@ fn sample_uv(
                         + (f64::from(component(neighbor, axis)) + 0.5)
                             * component_d(level.cell_size, axis);
                     let t = ((plane.value - center_position) / (neighbor_center - center_position))
-                        .clamp(0.0, 1.0) as f32;
+                        .clamp(0.0, 1.0);
                     (b - a).mul_add(t, a)
                 }
                 None => accessor
@@ -387,8 +387,8 @@ fn sample_uv(
     Ok(uv)
 }
 
-fn normalize_sample(value: f32, range: SampleRange) -> f32 {
-    ((f64::from(value) - range.min) / (range.max - range.min)).clamp(0.0, 1.0) as f32
+fn normalize_sample(value: f64, range: SampleRange) -> f32 {
+    ((value - range.min) / (range.max - range.min)).clamp(0.0, 1.0) as f32
 }
 
 fn physical_position(level: &SliceLevel<'_>, plane: SlicePlane, key: UVec3) -> [f32; 3] {
@@ -566,7 +566,7 @@ fn flip_winding(faces: &mut [[u32; 3]]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{CompactLevel, CompactPlot};
+    use crate::compact::{CompactLevel, CompactPlot, CompactScalarEncoding, CompactScalarGrid};
     use crate::utility::SparseGrid3;
     use glam::{IVec3, Vec3};
 
@@ -589,13 +589,14 @@ mod tests {
             variable_count: 2,
             refinement_ratios: Vec::new(),
             component_ids: vec![0, 1],
-            normalizations: Vec::new(),
+            encodings: vec![CompactScalarEncoding::F32; 2],
             levels: vec![CompactLevel {
                 level_index: 0,
                 index_origin: IVec3::ZERO,
                 physical_origin: DVec3::ZERO,
                 cell_size: DVec3::ONE,
-                components: vec![u, v],
+                components: vec![CompactScalarGrid::F32(u), CompactScalarGrid::F32(v)],
+                value_ranges: Vec::new(),
                 eligible_cubes,
             }],
         }
@@ -610,13 +611,14 @@ mod tests {
             variable_count: 1,
             refinement_ratios: Vec::new(),
             component_ids: vec![0],
-            normalizations: Vec::new(),
+            encodings: vec![CompactScalarEncoding::F32],
             levels: vec![CompactLevel {
                 level_index: 0,
                 index_origin: IVec3::ZERO,
                 physical_origin: DVec3::ZERO,
                 cell_size: DVec3::ONE,
-                components: vec![u],
+                components: vec![CompactScalarGrid::F32(u)],
+                value_ranges: Vec::new(),
                 eligible_cubes: SparseGrid3::new(UVec3::ZERO),
             }],
         }

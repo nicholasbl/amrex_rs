@@ -3,49 +3,49 @@
 //! Compact archives store selected components in a chunked sparse layout that
 //! can be reused by isosurface extraction without rereading AMReX FAB shards.
 
+mod archive;
+pub(crate) mod scalar;
+
+pub use scalar::{
+    CompactComponentEncoding, CompactScalarEncoding, NonFinitePolicy, NonFiniteReplacement,
+};
+
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use crate::sparse_amr::{SparseAmr, SparseAmrLevel};
-use crate::utility::{Aabb3u, SparseGrid3, SparseGridChunkView};
-use crate::{BoundingBox, CoordinateSystem, Header, IndexDomain, PlotFile, Variable};
+use crate::utility::{Aabb3u, SparseGrid3};
+use crate::{CoordinateSystem, Header, PlotFile, Variable};
 
 use anyhow::{Context, Result, ensure};
 use glam::{DVec3, IVec3, UVec3};
-use rkyv::{Archive, Deserialize, Serialize, rancor::Error};
+use rkyv::rancor::Error;
 
-const FORMAT_MAGIC: [u8; 8] = *b"AMRCMPCT";
-const FORMAT_VERSION: u32 = 2;
-
-/// An affine normalization applied to one component before it is stored.
-///
-/// Values are mapped from `[min, max]` to `[0, 1]` and clamped to that range.
-/// The calculation happens in `f64`, before compact storage converts to `f32`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CompactNormalization {
-    /// Plotfile component id to normalize.
-    pub component_id: u32,
-    /// Original value mapped to zero.
-    pub min: f64,
-    /// Original value mapped to one.
-    pub max: f64,
-}
+use archive::*;
+pub(crate) use scalar::{CompactScalarAccessor, CompactScalarGrid};
 
 /// Options controlling which data are written to a compact archive.
 #[derive(Debug, Default)]
 pub struct CompactOptions {
     /// Component ids to include. Empty means all plotfile variables.
     pub component_ids: Vec<u32>,
-    /// Optional per-component normalization bounds.
-    pub normalizations: Vec<CompactNormalization>,
+    /// Optional per-component encoding overrides. Unlisted components use f32.
+    pub encodings: Vec<CompactComponentEncoding>,
+    /// How non-finite source samples are handled.
+    pub non_finite_policy: NonFinitePolicy,
 }
 
 /// Result from a compaction operation
 #[derive(Debug, Default)]
 pub struct WriteCompactResult {
+    /// Time spent loading and indexing the sparse AMR hierarchy.
     pub compact_time: Duration,
+    /// Time spent building archive blocks and metadata.
     pub archive_time: Duration,
+    /// Time spent encoding and writing archive bytes.
     pub serialization_time: Duration,
+    /// Aggregate non-finite or unrepresentable replacements, omitting zero counts.
+    pub non_finite_replacements: Vec<NonFiniteReplacement>,
 }
 
 /// Write selected plotfile components as a compact binary archive.
@@ -60,154 +60,66 @@ pub fn write_compact(
     let now = Instant::now();
 
     let component_ids = selected_component_ids(plot_file, &options)?;
-    let normalizations = selected_normalizations(&component_ids, &options)?;
-    let compact =
-        CompactPlot::load_with_normalizations(plot_file, &component_ids, &normalizations)?;
+    let encodings = selected_encodings(&component_ids, &options)?;
+    let (compact, replacement_counts) = CompactPlot::load_with_encodings(
+        plot_file,
+        &component_ids,
+        &encodings,
+        options.non_finite_policy,
+    )?;
 
     let compact_time = now.elapsed();
-    let now = Instant::now();
-
-    let archive = CompactArchive::from_plot(plot_file.header(), compact)?;
-    let archive_time = now.elapsed();
-    let now = Instant::now();
-
-    let io_writer = rkyv::ser::writer::IoWriter::new(dest);
-    rkyv::api::high::to_bytes_in::<_, Error>(&archive, io_writer)
-        .context("serializing compact plot")?;
-
-    let serialization_time = now.elapsed();
+    let (archive_time, serialization_time) = write_archive(plot_file.header(), compact, dest)?;
+    let non_finite_replacements = component_ids
+        .iter()
+        .zip(replacement_counts)
+        .filter_map(|(&component_id, count)| {
+            (count != 0).then_some(NonFiniteReplacement {
+                component_id: component_id as u32,
+                count,
+            })
+        })
+        .collect();
 
     Ok(WriteCompactResult {
         compact_time,
         archive_time,
         serialization_time,
+        non_finite_replacements,
     })
 }
 
 /// Read a compact binary archive produced by [`write_compact`].
 pub fn read_compact(bytes: &[u8]) -> Result<CompactPlot> {
-    let archive =
-        rkyv::from_bytes::<CompactArchive, Error>(bytes).context("reading compact archive")?;
-    archive.into_compact_plot()
+    read_compact_impl(bytes, None)
 }
 
-/// Read only selected components from a compact archive without validating or
-/// deserializing the unused component grids.
+/// Read only selected components from a compact archive without deserializing
+/// unused component grids.
 ///
 /// The returned plot preserves the requested component order. Active-cube
 /// masks and archive metadata are still loaded for every AMR level.
 ///
-/// # Safety
-///
-/// `bytes` must contain a valid, properly aligned `CompactArchive` produced for
-/// this build's rkyv format, and must remain immutable for this call. Passing
-/// malformed bytes can cause undefined behavior.
-pub unsafe fn read_compact_selected_unchecked(
-    bytes: &[u8],
-    component_ids: &[u32],
-) -> Result<CompactPlot> {
+pub fn read_compact_selected(bytes: &[u8], component_ids: &[u32]) -> Result<CompactPlot> {
     ensure!(
         !component_ids.is_empty(),
         "at least one compact component must be selected"
     );
-    // SAFETY: The caller guarantees a valid immutable compact archive.
-    let archive = unsafe { rkyv::access_unchecked::<ArchivedCompactArchive>(bytes) };
-    validate_archive_envelope(archive)?;
+    read_compact_impl(bytes, Some(component_ids))
+}
 
-    let variable_count = archive.header.variables.len();
-    let mut selected_ids = Vec::with_capacity(component_ids.len());
-    let mut selected_slots = Vec::with_capacity(component_ids.len());
-    for &id in component_ids {
-        let id = usize::try_from(id).context("component id does not fit in usize")?;
-        ensure!(id < variable_count, "component index {id} is out of range");
-        ensure!(
-            !selected_ids.contains(&id),
-            "component index {id} was selected more than once"
-        );
-        let slot = archive
-            .component_ids
-            .iter()
-            .position(|archived_id| archived_id.to_native() as usize == id)
-            .with_context(|| format!("component index {id} is not stored in archive"))?;
-        selected_ids.push(id);
-        selected_slots.push(slot);
-    }
-
-    let variables = archive
-        .header
-        .variables
-        .iter()
-        .map(|variable| {
-            Ok(Variable {
-                name: variable.name.as_str().to_string(),
-                index: usize::try_from(variable.index.to_native())
-                    .context("variable index does not fit in usize")?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let levels = archive
-        .levels
-        .iter()
-        .map(|level| {
-            ensure!(
-                level.components.len() == archive.component_ids.len(),
-                "archive level component count mismatch"
-            );
-            let components = selected_slots
-                .iter()
-                .map(|&slot| {
-                    rkyv::deserialize::<ArchiveF32Grid, Error>(&level.components[slot])
-                        .context("deserializing selected compact component")?
-                        .into_grid()
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let active_cubes = rkyv::deserialize::<ArchiveMaskGrid, Error>(&level.active_cubes)
-                .context("deserializing compact active-cube mask")?
-                .into_grid();
-            Ok(CompactLevel {
-                level_index: usize::try_from(level.level_index.to_native())
-                    .context("level index does not fit in usize")?,
-                index_origin: IVec3::from_array(level.index_origin.map(|value| value.to_native())),
-                physical_origin: DVec3::from_array(
-                    level.physical_origin.map(|value| value.to_native()),
-                ),
-                cell_size: DVec3::from_array(level.cell_size.map(|value| value.to_native())),
-                components,
-                eligible_cubes: active_cubes,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let normalizations = archive
-        .normalizations
-        .iter()
-        .filter_map(|normalization| {
-            let component_id = normalization.component_id.to_native() as usize;
-            selected_ids
-                .contains(&component_id)
-                .then_some(CompactNormalization {
-                    component_id: component_id as u32,
-                    min: normalization.min.to_native(),
-                    max: normalization.max.to_native(),
-                })
-        })
-        .collect();
-
-    Ok(CompactPlot {
-        simulation_time: archive.header.simulation_time.to_native(),
-        variables,
-        variable_count,
-        refinement_ratios: archive
-            .header
-            .refinement_ratios
-            .iter()
-            .map(|ratio| ratio.to_native() as usize)
-            .collect(),
-        component_ids: selected_ids,
-        normalizations,
-        levels,
-    })
+/// Deprecated alias for [`read_compact_selected`].
+///
+/// # Safety
+///
+/// This function no longer performs unchecked operations. It remains unsafe
+/// only to avoid silently changing the contract of existing callers.
+#[deprecated(note = "use the safe read_compact_selected function")]
+pub unsafe fn read_compact_selected_unchecked(
+    bytes: &[u8],
+    component_ids: &[u32],
+) -> Result<CompactPlot> {
+    read_compact_selected(bytes, component_ids)
 }
 
 /// A zero-copy, read-only view of compact archive metadata.
@@ -215,18 +127,18 @@ pub unsafe fn read_compact_selected_unchecked(
 /// The view borrows the archive bytes and does not deserialize level grids,
 /// chunks, masks, or component values.
 pub struct CompactArchiveView<'a> {
-    archive: &'a ArchivedCompactArchive,
+    archive: &'a ArchivedCompactArchiveHeader,
 }
 
 /// Validate a compact archive and return a zero-copy view of its metadata.
 ///
-/// Validation checks the complete archived object graph. It does not allocate
-/// or deserialize the archived grids, but its initial cost is proportional to
-/// the size of the archive.
+/// Validation checks the metadata header object graph. Scalar and mask blocks
+/// are independently validated when [`read_compact`] loads them.
 pub fn view_compact(bytes: &[u8]) -> Result<CompactArchiveView<'_>> {
-    let archive = rkyv::access::<ArchivedCompactArchive, Error>(bytes)
-        .context("validating compact archive")?;
-    validate_archive_envelope(archive)?;
+    let header = archive_header_bytes(bytes)?;
+    let archive = rkyv::access::<ArchivedCompactArchiveHeader, Error>(header)
+        .context("validating compact archive header")?;
+    validate_archive_header(archive, bytes)?;
     Ok(CompactArchiveView { archive })
 }
 
@@ -237,14 +149,16 @@ pub fn view_compact(bytes: &[u8]) -> Result<CompactArchiveView<'_>> {
 ///
 /// # Safety
 ///
-/// `bytes` must contain a valid, properly aligned `CompactArchive` produced for
-/// this build's rkyv format, and the bytes must not be mutated for the lifetime
-/// of the returned view. Passing malformed bytes can cause undefined behavior.
+/// `bytes` must contain a valid, properly aligned compact metadata header
+/// produced for this build's rkyv format, and the bytes must not be mutated for
+/// the lifetime of the returned view. Passing malformed bytes can cause
+/// undefined behavior.
 pub unsafe fn view_compact_unchecked(bytes: &[u8]) -> Result<CompactArchiveView<'_>> {
     // SAFETY: The caller guarantees that `bytes` contain a valid archived
     // `CompactArchive` and remain immutable for the returned view's lifetime.
-    let archive = unsafe { rkyv::access_unchecked::<ArchivedCompactArchive>(bytes) };
-    validate_archive_envelope(archive)?;
+    let header = archive_header_bytes(bytes)?;
+    let archive = unsafe { rkyv::access_unchecked::<ArchivedCompactArchiveHeader>(header) };
+    validate_archive_header(archive, bytes)?;
     Ok(CompactArchiveView { archive })
 }
 
@@ -342,19 +256,37 @@ impl CompactArchiveView<'_> {
     /// Original plotfile component ids stored in this archive.
     pub fn component_ids(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
         self.archive
-            .component_ids
+            .components
             .iter()
-            .map(|id| id.to_native() as usize)
+            .map(|component| component.component_id.to_native() as usize)
     }
 
     /// Normalizations stored in the archive as `(component_id, min, max)`.
-    pub fn normalizations(&self) -> impl ExactSizeIterator<Item = (usize, f64, f64)> + '_ {
-        self.archive.normalizations.iter().map(|normalization| {
-            (
-                normalization.component_id.to_native() as usize,
-                normalization.min.to_native(),
-                normalization.max.to_native(),
+    pub fn normalizations(&self) -> impl Iterator<Item = (usize, f64, f64)> + '_ {
+        self.archive
+            .components
+            .iter()
+            .filter(|component| component.encoding == 2)
+            .map(|component| {
+                (
+                    component.component_id.to_native() as usize,
+                    component.min.to_native(),
+                    component.max.to_native(),
+                )
+            })
+    }
+
+    /// Scalar encodings stored in the archive as `(component_id, encoding)`.
+    pub fn component_encodings(&self) -> impl Iterator<Item = (usize, CompactScalarEncoding)> + '_ {
+        self.archive.components.iter().map(|component| {
+            let id = component.component_id.to_native() as usize;
+            let encoding = archived_encoding(
+                component.encoding,
+                component.min.to_native(),
+                component.max.to_native(),
             )
+            .expect("compact archive encoding was validated");
+            (id, encoding)
         })
     }
 
@@ -364,17 +296,7 @@ impl CompactArchiveView<'_> {
     }
 }
 
-fn validate_archive_envelope(archive: &ArchivedCompactArchive) -> Result<()> {
-    ensure!(
-        archive.magic == FORMAT_MAGIC,
-        "invalid compact archive magic {:?}",
-        archive.magic
-    );
-    ensure!(
-        archive.version == FORMAT_VERSION,
-        "unsupported compact archive version {}",
-        archive.version
-    );
+fn validate_archive_header(archive: &ArchivedCompactArchiveHeader, bytes: &[u8]) -> Result<()> {
     ensure!(
         archive.chunk_bits == crate::utility::CHUNK_BITS,
         "unsupported compact chunk size"
@@ -384,120 +306,93 @@ fn validate_archive_envelope(archive: &ArchivedCompactArchive) -> Result<()> {
         "invalid compact archive coordinate system {}",
         archive.header.coordinate_system
     );
-    for (position, normalization) in archive.normalizations.iter().enumerate() {
-        let component_id = normalization.component_id.to_native();
-        ensure!(
-            archive
-                .component_ids
-                .iter()
-                .any(|stored| stored.to_native() == component_id),
-            "normalization component {component_id} is not stored in archive"
-        );
-        ensure!(
-            archive.normalizations[..position]
-                .iter()
-                .all(|previous| previous.component_id.to_native() != component_id),
-            "component {component_id} has multiple normalizations"
-        );
-        validate_normalization_bounds(
-            normalization.min.to_native(),
-            normalization.max.to_native(),
+    for (index, component) in archive.components.iter().enumerate() {
+        archived_encoding(
+            component.encoding,
+            component.min.to_native(),
+            component.max.to_native(),
         )?;
+        let component_id = component.component_id.to_native() as usize;
+        ensure!(
+            component_id < archive.header.variables.len(),
+            "compact component index {component_id} is out of range"
+        );
+        ensure!(
+            !archive.components[..index]
+                .iter()
+                .any(|other| other.component_id == component.component_id),
+            "compact component index {component_id} is duplicated"
+        );
+    }
+    let expected_level_count = usize::try_from(archive.header.finest_level.to_native())
+        .context("compact finest level exceeds usize")?
+        .checked_add(1)
+        .context("compact level count overflow")?;
+    ensure!(
+        archive.levels.len() == expected_level_count,
+        "compact level count does not match finest level"
+    );
+
+    let header_start = bytes.len() - FOOTER_LENGTH as usize - archive_header_bytes(bytes)?.len();
+    let mut previous_end = PREFIX_LENGTH;
+    for (expected_level, level) in archive.levels.iter().enumerate() {
+        ensure!(
+            usize::try_from(level.level_index.to_native()).ok() == Some(expected_level),
+            "compact levels are not ordered coarse-to-fine"
+        );
+        ensure!(
+            level.components.len() == archive.components.len(),
+            "compact level component count mismatch"
+        );
+        for component in level.components.iter() {
+            previous_end = validate_archived_block(&component.data, previous_end, header_start)?;
+            for range in component.ranges.iter() {
+                let min = range.min.map(|value| value.to_native());
+                let max = range.max.map(|value| value.to_native());
+                let value_min = range.value_min.to_native();
+                let value_max = range.value_max.to_native();
+                ensure!(
+                    min.iter().zip(max).all(|(&min, max)| min <= max),
+                    "compact chunk range has invalid bounds"
+                );
+                ensure!(
+                    value_min.is_finite() && value_max.is_finite() && value_min <= value_max,
+                    "compact chunk range has invalid scalar bounds"
+                );
+            }
+        }
+        previous_end = validate_archived_block(&level.active_cubes, previous_end, header_start)?;
     }
     Ok(())
 }
 
-#[derive(Archive, Deserialize, Serialize)]
-struct CompactArchive {
-    magic: [u8; 8],
-    version: u32,
-    chunk_bits: u32,
-    header: ArchiveHeader,
-    component_ids: Vec<u32>,
-    normalizations: Vec<ArchiveNormalization>,
-    levels: Vec<ArchiveLevel>,
-}
-
-#[derive(Archive, Deserialize, Serialize)]
-struct ArchiveNormalization {
-    component_id: u32,
-    min: f64,
-    max: f64,
-}
-
-#[derive(Archive, Deserialize, Serialize)]
-struct ArchiveHeader {
-    simulation_time: f64,
-    finest_level: u64,
-    domain: ArchiveBoundingBox,
-    variables: Vec<ArchiveVariable>,
-    refinement_ratios: Vec<u64>,
-    index_domains: Vec<ArchiveIndexDomain>,
-    level_steps: Vec<u64>,
-    cell_sizes: Vec<[f64; 3]>,
-    coordinate_system: u8,
-    boundary_width: u64,
-}
-
-#[derive(Archive, Deserialize, Serialize)]
-struct ArchiveVariable {
-    name: String,
-    index: u64,
-}
-
-#[derive(Archive, Deserialize, Serialize)]
-struct ArchiveBoundingBox {
-    min: [f64; 3],
-    max: [f64; 3],
-}
-
-#[derive(Archive, Deserialize, Serialize)]
-struct ArchiveIndexDomain {
-    min: [i32; 3],
-    max: [i32; 3],
-    index_type: [i32; 3],
-}
-
-#[derive(Archive, Deserialize, Serialize)]
-struct ArchiveLevel {
-    level_index: u64,
-    index_origin: [i32; 3],
-    physical_origin: [f64; 3],
-    cell_size: [f64; 3],
-    components: Vec<ArchiveF32Grid>,
-    active_cubes: ArchiveMaskGrid,
-}
-
-#[derive(Archive, Deserialize, Serialize)]
-struct ArchiveF32Grid {
-    bounds: [u32; 3],
-    chunks: Vec<ArchiveF32Chunk>,
-}
-
-#[derive(Archive, Deserialize, Serialize)]
-enum ArchiveF32Chunk {
-    Uniform {
-        key: [u32; 3],
-        value: f32,
-        mask: Box<[u64; crate::utility::MASK_WORDS]>,
-    },
-    Dense {
-        key: [u32; 3],
-        values: Vec<f32>,
-        mask: Box<[u64; crate::utility::MASK_WORDS]>,
-    },
-}
-
-#[derive(Archive, Deserialize, Serialize)]
-struct ArchiveMaskGrid {
-    bounds: [u32; 3],
-    chunks: Vec<ArchiveMaskChunk>,
-}
-
-#[derive(Archive, Deserialize, Serialize)]
-struct ArchiveMaskChunk {
-    key: [u32; 3],
-    mask: Box<[u64; crate::utility::MASK_WORDS]>,
+fn validate_archived_block(
+    block: &ArchivedArchiveBlock,
+    previous_end: u64,
+    header_start: usize,
+) -> Result<u64> {
+    ensure!(
+        matches!(block.compression, ArchivedArchiveCompression::None),
+        "unsupported compact block compression"
+    );
+    let offset = block.offset.to_native();
+    let stored_length = block.stored_length.to_native();
+    ensure!(
+        offset.is_multiple_of(8),
+        "compact block is not 8-byte aligned"
+    );
+    ensure!(
+        stored_length == block.decoded_length.to_native(),
+        "invalid uncompressed block lengths"
+    );
+    let end = offset
+        .checked_add(stored_length)
+        .context("compact block extent overflow")?;
+    ensure!(
+        offset >= previous_end && end <= header_start as u64,
+        "compact block is out of order or out of bounds"
+    );
+    Ok(end)
 }
 
 /// Sparse AMR data loaded from a plotfile or compact archive.
@@ -510,7 +405,7 @@ pub struct CompactPlot {
     pub(crate) variable_count: usize,
     pub(crate) refinement_ratios: Vec<usize>,
     pub(crate) component_ids: Vec<usize>,
-    pub(crate) normalizations: Vec<CompactNormalization>,
+    pub(crate) encodings: Vec<CompactScalarEncoding>,
     pub(crate) levels: Vec<CompactLevel>,
 }
 
@@ -525,13 +420,13 @@ pub struct CompactComponentStats {
     /// Number of present values that are NaN.
     pub nan_count: usize,
     /// Smallest non-NaN value across all AMR levels.
-    pub min: Option<f32>,
+    pub min: Option<f64>,
     /// Largest non-NaN value across all AMR levels.
-    pub max: Option<f32>,
+    pub max: Option<f64>,
 }
 
 impl CompactComponentStats {
-    fn observe(&mut self, value: f32) {
+    fn observe(&mut self, value: f64) {
         self.value_count += 1;
         if value.is_nan() {
             self.nan_count += 1;
@@ -548,8 +443,16 @@ pub(crate) struct CompactLevel {
     pub(crate) index_origin: IVec3,
     pub(crate) physical_origin: DVec3,
     pub(crate) cell_size: DVec3,
-    pub(crate) components: Vec<SparseGrid3<f32>>,
+    pub(crate) components: Vec<CompactScalarGrid>,
+    pub(crate) value_ranges: Vec<Vec<ChunkValueRange>>,
     pub(crate) eligible_cubes: SparseGrid3<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ChunkValueRange {
+    pub(crate) aabb: Aabb3u,
+    pub(crate) min: f64,
+    pub(crate) max: f64,
 }
 
 impl CompactPlot {
@@ -558,20 +461,29 @@ impl CompactPlot {
     /// `component_ids` are plotfile variable indices. At least one component is
     /// required because the first component defines active dual cubes.
     pub fn load(plot_file: &PlotFile, component_ids: &[usize]) -> Result<Self> {
-        Self::load_with_normalizations(plot_file, component_ids, &vec![None; component_ids.len()])
+        let encodings = vec![CompactScalarEncoding::F32; component_ids.len()];
+        Self::load_with_encodings(
+            plot_file,
+            component_ids,
+            &encodings,
+            NonFinitePolicy::ReplaceWithZero,
+        )
+        .map(|(plot, _)| plot)
     }
 
-    fn load_with_normalizations(
+    fn load_with_encodings(
         plot_file: &PlotFile,
         component_ids: &[usize],
-        normalizations: &[Option<(f64, f64)>],
-    ) -> Result<Self> {
-        let sparse_amr = SparseAmr::load(plot_file, component_ids, normalizations)?;
+        encodings: &[CompactScalarEncoding],
+        non_finite_policy: NonFinitePolicy,
+    ) -> Result<(Self, Vec<usize>)> {
+        let sparse_amr = SparseAmr::load(plot_file, component_ids, encodings, non_finite_policy)?;
         ensure!(
             sparse_amr.component_ids == component_ids,
             "sparse AMR component order changed while loading"
         );
 
+        let non_finite_replacements = sparse_amr.non_finite_replacements;
         let mut levels: Vec<CompactLevel> = Vec::with_capacity(sparse_amr.levels.len());
         for sparse_level in sparse_amr.levels {
             let SparseAmrLevel {
@@ -581,54 +493,53 @@ impl CompactPlot {
                 physical_origin,
                 cell_size,
                 components,
+                non_finite_replacements: _,
                 valid_regions,
             } = sparse_level;
             ensure!(
                 index_type == IVec3::ZERO,
                 "compact plot extraction requires cell-centered data"
             );
-            let eligible_cubes = build_active_dual_cubes(
+            let eligible_cubes = build_active_dual_cubes_for_scalar(
                 components
                     .first()
                     .context("compact plot requires at least one component")?,
                 &valid_regions,
             );
+            let value_ranges = components
+                .iter()
+                .map(|component| build_chunk_value_ranges(component, &eligible_cubes))
+                .collect();
             levels.push(CompactLevel {
                 level_index,
                 index_origin,
                 physical_origin,
                 cell_size,
                 components,
+                value_ranges,
                 eligible_cubes,
             });
         }
 
-        Ok(Self {
-            simulation_time: plot_file.header().simulation_time,
-            variables: plot_file
-                .variables()
-                .iter()
-                .map(|variable| Variable {
-                    name: variable.name.clone(),
-                    index: variable.index,
-                })
-                .collect(),
-            variable_count: plot_file.variables().len(),
-            refinement_ratios: plot_file.header().refinement_ratios.clone(),
-            component_ids: component_ids.to_vec(),
-            normalizations: component_ids
-                .iter()
-                .zip(normalizations)
-                .filter_map(|(&component_id, &bounds)| {
-                    bounds.map(|(min, max)| CompactNormalization {
-                        component_id: component_id as u32,
-                        min,
-                        max,
+        Ok((
+            Self {
+                simulation_time: plot_file.header().simulation_time,
+                variables: plot_file
+                    .variables()
+                    .iter()
+                    .map(|variable| Variable {
+                        name: variable.name.clone(),
+                        index: variable.index,
                     })
-                })
-                .collect(),
-            levels,
-        })
+                    .collect(),
+                variable_count: plot_file.variables().len(),
+                refinement_ratios: plot_file.header().refinement_ratios.clone(),
+                component_ids: component_ids.to_vec(),
+                encodings: encodings.to_vec(),
+                levels,
+            },
+            non_finite_replacements,
+        ))
     }
 
     /// Simulation time from the original plotfile header.
@@ -653,10 +564,16 @@ impl CompactPlot {
 
     /// Return the original normalization bounds for a stored component.
     pub fn component_normalization(&self, component_id: usize) -> Option<(f64, f64)> {
-        self.normalizations
-            .iter()
-            .find(|normalization| normalization.component_id as usize == component_id)
-            .map(|normalization| (normalization.min, normalization.max))
+        match self.component_encoding(component_id)? {
+            CompactScalarEncoding::UNorm32 { min, max } => Some((min, max)),
+            CompactScalarEncoding::F32 | CompactScalarEncoding::F64 => None,
+        }
+    }
+
+    /// Scalar representation used for a stored component.
+    pub fn component_encoding(&self, component_id: usize) -> Option<CompactScalarEncoding> {
+        self.component_slot(component_id)
+            .and_then(|slot| self.encodings.get(slot).copied())
     }
 
     /// Number of AMR levels stored in this compact plot.
@@ -673,7 +590,7 @@ impl CompactPlot {
 
         for level in &self.levels {
             let grid = &level.components[slot];
-            grid.for_each_present_in_aabb(grid.bounds_aabb(), |_, value| stats.observe(value));
+            grid.for_each_value_in_aabb(grid.bounds_aabb(), |_, value| stats.observe(value));
         }
 
         Some(stats)
@@ -686,309 +603,359 @@ impl CompactPlot {
     }
 }
 
-impl CompactArchive {
-    fn from_plot(header: &Header, compact: CompactPlot) -> Result<Self> {
-        Ok(Self {
-            magic: FORMAT_MAGIC,
-            version: FORMAT_VERSION,
-            chunk_bits: crate::utility::CHUNK_BITS,
-            header: ArchiveHeader::from_header(header),
-            component_ids: compact
-                .component_ids
-                .into_iter()
-                .map(|id| u32::try_from(id).context("component id does not fit in u32"))
-                .collect::<Result<Vec<_>>>()?,
-            normalizations: compact
-                .normalizations
-                .into_iter()
-                .map(|normalization| ArchiveNormalization {
-                    component_id: normalization.component_id,
-                    min: normalization.min,
-                    max: normalization.max,
-                })
-                .collect(),
-            levels: compact
-                .levels
-                .into_iter()
-                .map(ArchiveLevel::from_level)
-                .collect::<Result<Vec<_>>>()?,
-        })
-    }
+fn write_archive(
+    source_header: &Header,
+    compact: CompactPlot,
+    dest: &mut impl Write,
+) -> Result<(Duration, Duration)> {
+    let mut archive_time = Duration::ZERO;
+    let mut serialization_time = Duration::ZERO;
+    let write_start = Instant::now();
+    dest.write_all(&FORMAT_MAGIC.to_le_bytes())?;
+    dest.write_all(&FORMAT_VERSION.to_le_bytes())?;
+    serialization_time += write_start.elapsed();
+    let mut offset = PREFIX_LENGTH;
 
-    fn into_compact_plot(self) -> Result<CompactPlot> {
-        ensure!(self.magic == FORMAT_MAGIC, "invalid compact archive magic");
+    let CompactPlot {
+        encodings,
+        component_ids,
+        levels,
+        ..
+    } = compact;
+    let mut archive_levels = Vec::with_capacity(levels.len());
+
+    for level in levels {
         ensure!(
-            self.version == FORMAT_VERSION,
-            "unsupported compact archive version {}",
-            self.version
+            level.components.len() == component_ids.len()
+                && level.value_ranges.len() == component_ids.len(),
+            "compact level component metadata mismatch"
         );
-        ensure!(
-            self.chunk_bits == crate::utility::CHUNK_BITS,
-            "unsupported compact chunk size"
-        );
-
-        let variables = self
-            .header
-            .variables
-            .into_iter()
-            .map(Variable::try_from)
-            .collect::<Result<Vec<_>>>()?;
-        let variable_count = variables.len();
-        let component_ids = self
-            .component_ids
-            .into_iter()
-            .map(|id| {
-                let id = usize::try_from(id).context("component id does not fit in usize")?;
-                ensure!(
-                    id < variable_count,
-                    "component index {id} is out of range for archive"
-                );
-                Ok(id)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut normalizations = Vec::with_capacity(self.normalizations.len());
-        for normalization in self.normalizations {
-            let component_id = usize::try_from(normalization.component_id)
-                .context("normalization component id does not fit in usize")?;
-            ensure!(
-                component_ids.contains(&component_id),
-                "normalization component {component_id} is not stored in archive"
-            );
-            ensure!(
-                normalizations
+        let mut component_blocks = Vec::with_capacity(level.components.len());
+        for (component, ranges) in level.components.iter().zip(&level.value_ranges) {
+            let bytes = match component {
+                CompactScalarGrid::F32(grid) => {
+                    let start = Instant::now();
+                    let grid = archive_scalar_grid(grid);
+                    archive_time += start.elapsed();
+                    let start = Instant::now();
+                    let bytes = rkyv::to_bytes::<Error>(&grid)
+                        .context("serializing f32 compact component")?;
+                    serialization_time += start.elapsed();
+                    bytes
+                }
+                CompactScalarGrid::F64(grid) => {
+                    let start = Instant::now();
+                    let grid = archive_scalar_grid(grid);
+                    archive_time += start.elapsed();
+                    let start = Instant::now();
+                    let bytes = rkyv::to_bytes::<Error>(&grid)
+                        .context("serializing f64 compact component")?;
+                    serialization_time += start.elapsed();
+                    bytes
+                }
+                CompactScalarGrid::UNorm32 { values, .. } => {
+                    let start = Instant::now();
+                    let grid = archive_scalar_grid(values);
+                    archive_time += start.elapsed();
+                    let start = Instant::now();
+                    let bytes = rkyv::to_bytes::<Error>(&grid)
+                        .context("serializing UNorm32 compact component")?;
+                    serialization_time += start.elapsed();
+                    bytes
+                }
+            };
+            let write_start = Instant::now();
+            let data = write_block(dest, &mut offset, &bytes)?;
+            serialization_time += write_start.elapsed();
+            let archive_start = Instant::now();
+            component_blocks.push(ArchiveComponentBlock {
+                data,
+                ranges: ranges
                     .iter()
-                    .all(|existing: &CompactNormalization| {
-                        existing.component_id != normalization.component_id
-                    }),
-                "component {component_id} has multiple normalizations"
-            );
-            validate_normalization_bounds(normalization.min, normalization.max)?;
-            normalizations.push(CompactNormalization {
-                component_id: normalization.component_id,
-                min: normalization.min,
-                max: normalization.max,
+                    .map(|range| ArchiveChunkRange {
+                        min: uvec3_to_array(range.aabb.min),
+                        max: uvec3_to_array(range.aabb.max),
+                        value_min: range.min,
+                        value_max: range.max,
+                    })
+                    .collect(),
             });
+            archive_time += archive_start.elapsed();
         }
 
-        let levels = self
-            .levels
-            .into_iter()
-            .map(|level| level.into_compact_level(component_ids.len()))
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(CompactPlot {
-            simulation_time: self.header.simulation_time,
-            variables,
-            variable_count,
-            refinement_ratios: self
-                .header
-                .refinement_ratios
-                .into_iter()
-                .map(|ratio| {
-                    usize::try_from(ratio).context("refinement ratio does not fit in usize")
-                })
-                .collect::<Result<Vec<_>>>()?,
-            component_ids,
-            normalizations,
-            levels,
-        })
-    }
-}
-
-impl ArchiveHeader {
-    fn from_header(header: &Header) -> Self {
-        Self {
-            simulation_time: header.simulation_time,
-            finest_level: header.finest_level as u64,
-            domain: ArchiveBoundingBox::from_bounding_box(&header.domain),
-            variables: header
-                .variables
-                .iter()
-                .map(ArchiveVariable::from_variable)
-                .collect(),
-            refinement_ratios: header.refinement_ratios.iter().map(|&x| x as u64).collect(),
-            index_domains: header
-                .index_domains
-                .iter()
-                .map(ArchiveIndexDomain::from_index_domain)
-                .collect(),
-            level_steps: header.level_steps.iter().map(|&x| x as u64).collect(),
-            cell_sizes: header
-                .cell_sizes
-                .iter()
-                .map(|&v| dvec3_to_array(v))
-                .collect(),
-            coordinate_system: match header.coordinate_system {
-                CoordinateSystem::Cartesian => 0,
-                CoordinateSystem::Cylindrical => 1,
-                CoordinateSystem::Spherical => 2,
-            },
-            boundary_width: header.boundary_width as u64,
-        }
-    }
-}
-
-impl ArchiveVariable {
-    fn from_variable(variable: &Variable) -> Self {
-        Self {
-            name: variable.name.clone(),
-            index: variable.index as u64,
-        }
-    }
-}
-
-impl TryFrom<ArchiveVariable> for Variable {
-    type Error = anyhow::Error;
-
-    fn try_from(variable: ArchiveVariable) -> Result<Self> {
-        Ok(Self {
-            name: variable.name,
-            index: usize::try_from(variable.index)
-                .context("variable index does not fit in usize")?,
-        })
-    }
-}
-
-impl ArchiveBoundingBox {
-    fn from_bounding_box(bounds: &BoundingBox) -> Self {
-        Self {
-            min: dvec3_to_array(bounds.min),
-            max: dvec3_to_array(bounds.max),
-        }
-    }
-}
-
-impl ArchiveIndexDomain {
-    fn from_index_domain(domain: &IndexDomain) -> Self {
-        Self {
-            min: ivec3_to_array(domain.min),
-            max: ivec3_to_array(domain.max),
-            index_type: ivec3_to_array(domain.index_type),
-        }
-    }
-}
-
-impl ArchiveLevel {
-    fn from_level(level: CompactLevel) -> Result<Self> {
-        Ok(Self {
+        let start = Instant::now();
+        let mask = ArchiveMaskGrid::from_grid(&level.eligible_cubes);
+        archive_time += start.elapsed();
+        let start = Instant::now();
+        let mask_bytes =
+            rkyv::to_bytes::<Error>(&mask).context("serializing compact active-cube mask")?;
+        serialization_time += start.elapsed();
+        let write_start = Instant::now();
+        let active_cubes = write_block(dest, &mut offset, &mask_bytes)?;
+        serialization_time += write_start.elapsed();
+        let archive_start = Instant::now();
+        archive_levels.push(ArchiveLevel {
             level_index: level.level_index as u64,
             index_origin: ivec3_to_array(level.index_origin),
             physical_origin: dvec3_to_array(level.physical_origin),
             cell_size: dvec3_to_array(level.cell_size),
-            components: level
+            components: component_blocks,
+            active_cubes,
+        });
+        archive_time += archive_start.elapsed();
+    }
+
+    let archive_start = Instant::now();
+    let components = component_ids
+        .into_iter()
+        .zip(encodings)
+        .map(|(component_id, encoding)| {
+            let (encoding, min, max) = encoding_fields(encoding);
+            Ok(ArchiveStoredComponent {
+                component_id: u32::try_from(component_id)
+                    .context("component id does not fit in u32")?,
+                encoding,
+                min,
+                max,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let archive = CompactArchiveHeader {
+        chunk_bits: crate::utility::CHUNK_BITS,
+        header: ArchiveHeader::from_header(source_header),
+        components,
+        levels: archive_levels,
+    };
+    archive_time += archive_start.elapsed();
+    let serialization_start = Instant::now();
+    let header_bytes = rkyv::to_bytes::<Error>(&archive).context("serializing compact header")?;
+    serialization_time += serialization_start.elapsed();
+
+    let write_start = Instant::now();
+    align_writer(dest, &mut offset)?;
+    let header_offset = offset;
+    dest.write_all(&header_bytes)?;
+    offset = offset
+        .checked_add(header_bytes.len() as u64)
+        .context("compact file length overflow")?;
+    dest.write_all(&header_offset.to_le_bytes())?;
+    let _final_length = offset
+        .checked_add(FOOTER_LENGTH)
+        .context("compact file length overflow")?;
+    serialization_time += write_start.elapsed();
+
+    Ok((archive_time, serialization_time))
+}
+
+fn write_block(dest: &mut impl Write, offset: &mut u64, bytes: &[u8]) -> Result<ArchiveBlock> {
+    align_writer(dest, offset)?;
+    let block_offset = *offset;
+    dest.write_all(bytes)?;
+    *offset = offset
+        .checked_add(bytes.len() as u64)
+        .context("compact file length overflow")?;
+    Ok(ArchiveBlock {
+        offset: block_offset,
+        stored_length: bytes.len() as u64,
+        decoded_length: bytes.len() as u64,
+        compression: ArchiveCompression::None,
+    })
+}
+
+fn align_writer(dest: &mut impl Write, offset: &mut u64) -> Result<()> {
+    let padding = (8 - (*offset % 8)) % 8;
+    if padding != 0 {
+        dest.write_all(&[0; 7][..padding as usize])?;
+        *offset += padding;
+    }
+    Ok(())
+}
+
+fn archive_header_bytes(bytes: &[u8]) -> Result<&[u8]> {
+    ensure!(
+        bytes.len() >= (PREFIX_LENGTH + FOOTER_LENGTH) as usize,
+        "compact file is truncated"
+    );
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    ensure!(magic == FORMAT_MAGIC, "invalid compact archive magic");
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    ensure!(
+        version == FORMAT_VERSION,
+        "unsupported compact archive version {version}; regenerate the archive"
+    );
+    let footer_start = bytes.len() - FOOTER_LENGTH as usize;
+    let header_offset = u64::from_le_bytes(bytes[footer_start..].try_into().unwrap());
+    ensure!(
+        header_offset.is_multiple_of(8),
+        "compact header is not 8-byte aligned"
+    );
+    let header_offset = usize::try_from(header_offset).context("header offset exceeds usize")?;
+    ensure!(
+        header_offset >= PREFIX_LENGTH as usize && header_offset < footer_start,
+        "compact header offset is out of bounds"
+    );
+    Ok(&bytes[header_offset..footer_start])
+}
+
+fn read_compact_impl(bytes: &[u8], requested: Option<&[u32]>) -> Result<CompactPlot> {
+    let view = view_compact(bytes).context("validating compact archive metadata")?;
+    let archive = rkyv::deserialize::<CompactArchiveHeader, Error>(view.archive)
+        .context("deserializing compact archive header")?;
+    ensure!(
+        archive.chunk_bits == crate::utility::CHUNK_BITS,
+        "unsupported compact chunk size"
+    );
+
+    let variables = archive
+        .header
+        .variables
+        .iter()
+        .cloned()
+        .map(Variable::try_from)
+        .collect::<Result<Vec<_>>>()?;
+    let variable_count = variables.len();
+    let requested_ids = requested
+        .map(|ids| ids.iter().map(|&id| id as usize).collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            archive
                 .components
                 .iter()
-                .map(ArchiveF32Grid::from_grid)
-                .collect::<Result<Vec<_>>>()?,
-            active_cubes: ArchiveMaskGrid::from_grid(&level.eligible_cubes),
-        })
-    }
-
-    fn into_compact_level(self, component_count: usize) -> Result<CompactLevel> {
+                .map(|component| component.component_id as usize)
+                .collect()
+        });
+    let mut selected_slots = Vec::with_capacity(requested_ids.len());
+    for (position, &id) in requested_ids.iter().enumerate() {
+        ensure!(id < variable_count, "component index {id} is out of range");
         ensure!(
-            self.components.len() == component_count,
-            "archive level component count mismatch"
+            !requested_ids[..position].contains(&id),
+            "component index {id} was selected more than once"
         );
-        Ok(CompactLevel {
-            level_index: usize::try_from(self.level_index)
-                .context("level index does not fit in usize")?,
-            index_origin: array_to_ivec3(self.index_origin),
-            physical_origin: array_to_dvec3(self.physical_origin),
-            cell_size: array_to_dvec3(self.cell_size),
-            components: self
+        selected_slots.push(
+            archive
                 .components
-                .into_iter()
-                .map(ArchiveF32Grid::into_grid)
-                .collect::<Result<Vec<_>>>()?,
-            eligible_cubes: self.active_cubes.into_grid(),
+                .iter()
+                .position(|component| component.component_id as usize == id)
+                .with_context(|| format!("component index {id} is not stored in archive"))?,
+        );
+    }
+    let encodings = selected_slots
+        .iter()
+        .map(|&slot| {
+            let component = &archive.components[slot];
+            archived_encoding(component.encoding, component.min, component.max)
         })
-    }
-}
+        .collect::<Result<Vec<_>>>()?;
 
-impl ArchiveF32Grid {
-    fn from_grid(grid: &SparseGrid3<f32>) -> Result<Self> {
-        let mut chunks = Vec::with_capacity(grid.chunk_count());
-        grid.for_each_chunk(|chunk| match chunk {
-            SparseGridChunkView::Uniform { key, value, mask } => {
-                chunks.push(ArchiveF32Chunk::Uniform {
-                    key: uvec3_to_array(key),
-                    value,
-                    mask: Box::new(mask),
-                });
-            }
-            SparseGridChunkView::Dense { key, values, mask } => {
-                chunks.push(ArchiveF32Chunk::Dense {
-                    key: uvec3_to_array(key),
-                    values: values.to_vec(),
-                    mask: Box::new(mask),
-                });
-            }
-        });
-        chunks.sort_by_key(ArchiveF32Chunk::key);
-        Ok(Self {
-            bounds: uvec3_to_array(grid.bounds()),
-            chunks,
+    let levels = archive
+        .levels
+        .iter()
+        .map(|level| {
+            ensure!(
+                level.components.len() == archive.components.len(),
+                "archive level component count mismatch"
+            );
+            let components = selected_slots
+                .iter()
+                .zip(&encodings)
+                .map(|(&slot, &encoding)| {
+                    read_scalar_block(bytes, &level.components[slot].data, encoding)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let value_ranges = selected_slots
+                .iter()
+                .map(|&slot| {
+                    level.components[slot]
+                        .ranges
+                        .iter()
+                        .map(|range| ChunkValueRange {
+                            aabb: Aabb3u::new(array_to_uvec3(range.min), array_to_uvec3(range.max)),
+                            min: range.value_min,
+                            max: range.value_max,
+                        })
+                        .collect()
+                })
+                .collect();
+            let mask_slice = block_slice(bytes, &level.active_cubes)?;
+            let active_cubes = rkyv::from_bytes::<ArchiveMaskGrid, Error>(mask_slice)
+                .context("reading compact active-cube block")?
+                .into_grid();
+            Ok(CompactLevel {
+                level_index: usize::try_from(level.level_index)
+                    .context("level index does not fit in usize")?,
+                index_origin: array_to_ivec3(level.index_origin),
+                physical_origin: array_to_dvec3(level.physical_origin),
+                cell_size: array_to_dvec3(level.cell_size),
+                components,
+                value_ranges,
+                eligible_cubes: active_cubes,
+            })
         })
-    }
+        .collect::<Result<Vec<_>>>()?;
 
-    fn into_grid(self) -> Result<SparseGrid3<f32>> {
-        let mut grid =
-            SparseGrid3::with_chunk_capacity(array_to_uvec3(self.bounds), self.chunks.len());
-        for chunk in self.chunks {
-            match chunk {
-                ArchiveF32Chunk::Uniform { key, value, mask } => {
-                    grid.insert_uniform_chunk(array_to_uvec3(key), value, *mask);
-                }
-                ArchiveF32Chunk::Dense { key, values, mask } => {
-                    ensure!(
-                        values.len() == crate::utility::CHUNK_VOLUME,
-                        "dense chunk has {} values; expected {}",
-                        values.len(),
-                        crate::utility::CHUNK_VOLUME
-                    );
-                    grid.insert_dense_chunk(array_to_uvec3(key), values.into_boxed_slice(), *mask);
-                }
-            }
-        }
-        Ok(grid)
-    }
+    Ok(CompactPlot {
+        simulation_time: archive.header.simulation_time,
+        variables,
+        variable_count,
+        refinement_ratios: archive
+            .header
+            .refinement_ratios
+            .iter()
+            .map(|&ratio| usize::try_from(ratio).context("refinement ratio does not fit in usize"))
+            .collect::<Result<Vec<_>>>()?,
+        component_ids: requested_ids,
+        encodings,
+        levels,
+    })
 }
 
-impl ArchiveF32Chunk {
-    fn key(&self) -> [u32; 3] {
-        match self {
-            Self::Uniform { key, .. } | Self::Dense { key, .. } => *key,
-        }
-    }
+fn block_slice<'a>(bytes: &'a [u8], block: &ArchiveBlock) -> Result<&'a [u8]> {
+    ensure!(
+        matches!(block.compression, ArchiveCompression::None),
+        "unsupported compact block compression"
+    );
+    ensure!(
+        block.stored_length == block.decoded_length,
+        "invalid uncompressed block lengths"
+    );
+    ensure!(
+        block.offset.is_multiple_of(8),
+        "compact block is not 8-byte aligned"
+    );
+    let start = usize::try_from(block.offset).context("block offset exceeds usize")?;
+    let length = usize::try_from(block.stored_length).context("block length exceeds usize")?;
+    let end = start.checked_add(length).context("block extent overflow")?;
+    let header_start = bytes.len() - FOOTER_LENGTH as usize - archive_header_bytes(bytes)?.len();
+    ensure!(
+        start >= PREFIX_LENGTH as usize && end <= header_start,
+        "compact block is out of bounds"
+    );
+    Ok(&bytes[start..end])
 }
 
-impl ArchiveMaskGrid {
-    fn from_grid(grid: &SparseGrid3<()>) -> Self {
-        let mut chunks = Vec::with_capacity(grid.chunk_count());
-        grid.for_each_chunk(|chunk| match chunk {
-            SparseGridChunkView::Uniform { key, mask, .. }
-            | SparseGridChunkView::Dense { key, mask, .. } => {
-                chunks.push(ArchiveMaskChunk {
-                    key: uvec3_to_array(key),
-                    mask: Box::new(mask),
-                });
-            }
-        });
-        chunks.sort_by_key(|chunk| chunk.key);
-        Self {
-            bounds: uvec3_to_array(grid.bounds()),
-            chunks,
-        }
-    }
-
-    fn into_grid(self) -> SparseGrid3<()> {
-        let mut grid =
-            SparseGrid3::with_chunk_capacity(array_to_uvec3(self.bounds), self.chunks.len());
-        for chunk in self.chunks {
-            grid.insert_uniform_chunk(array_to_uvec3(chunk.key), (), *chunk.mask);
-        }
-        grid
+fn read_scalar_block(
+    bytes: &[u8],
+    block: &ArchiveBlock,
+    encoding: CompactScalarEncoding,
+) -> Result<CompactScalarGrid> {
+    let block = block_slice(bytes, block)?;
+    match encoding {
+        CompactScalarEncoding::F32 => Ok(CompactScalarGrid::F32(
+            rkyv::from_bytes::<ArchiveScalarGrid<f32>, Error>(block)
+                .context("reading f32 compact component")?
+                .into_grid()?,
+        )),
+        CompactScalarEncoding::F64 => Ok(CompactScalarGrid::F64(
+            rkyv::from_bytes::<ArchiveScalarGrid<f64>, Error>(block)
+                .context("reading f64 compact component")?
+                .into_grid()?,
+        )),
+        CompactScalarEncoding::UNorm32 { min, max } => Ok(CompactScalarGrid::UNorm32 {
+            values: rkyv::from_bytes::<ArchiveScalarGrid<u32>, Error>(block)
+                .context("reading UNorm32 compact component")?
+                .into_grid()?,
+            min,
+            max,
+        }),
     }
 }
 
@@ -1018,72 +985,52 @@ fn selected_component_ids(plot_file: &PlotFile, options: &CompactOptions) -> Res
     Ok(component_ids)
 }
 
-fn selected_normalizations(
+fn selected_encodings(
     component_ids: &[usize],
     options: &CompactOptions,
-) -> Result<Vec<Option<(f64, f64)>>> {
-    let mut result = vec![None; component_ids.len()];
-    for normalization in &options.normalizations {
-        validate_normalization_bounds(normalization.min, normalization.max)?;
-        let component_id = usize::try_from(normalization.component_id)
-            .context("normalization component id does not fit in usize")?;
+) -> Result<Vec<CompactScalarEncoding>> {
+    let mut result = vec![CompactScalarEncoding::F32; component_ids.len()];
+    let mut assigned = vec![false; component_ids.len()];
+    for requested in &options.encodings {
+        requested.encoding.validate()?;
+        let component_id = usize::try_from(requested.component_id)
+            .context("encoding component id does not fit in usize")?;
         let slot = component_ids
             .iter()
             .position(|&id| id == component_id)
             .with_context(|| {
-                format!("normalization component {component_id} is not selected for compaction")
+                format!("encoding component {component_id} is not selected for compaction")
             })?;
         ensure!(
-            result[slot].is_none(),
-            "component {component_id} has multiple normalizations"
+            !assigned[slot],
+            "component {component_id} has multiple encoding overrides"
         );
-        result[slot] = Some((normalization.min, normalization.max));
+        assigned[slot] = true;
+        result[slot] = requested.encoding;
     }
     Ok(result)
 }
 
-fn validate_normalization_bounds(min: f64, max: f64) -> Result<()> {
-    ensure!(min.is_finite(), "normalization minimum must be finite");
-    ensure!(max.is_finite(), "normalization maximum must be finite");
-    ensure!(
-        max > min,
-        "normalization maximum must be greater than minimum"
-    );
-    ensure!(
-        (max - min).is_finite(),
-        "normalization range must be finite"
-    );
-    Ok(())
-}
-
-fn uvec3_to_array(v: UVec3) -> [u32; 3] {
-    [v.x, v.y, v.z]
-}
-
-fn array_to_uvec3(v: [u32; 3]) -> UVec3 {
-    UVec3::new(v[0], v[1], v[2])
-}
-
-fn ivec3_to_array(v: IVec3) -> [i32; 3] {
-    [v.x, v.y, v.z]
-}
-
-fn array_to_ivec3(v: [i32; 3]) -> IVec3 {
-    IVec3::new(v[0], v[1], v[2])
-}
-
-fn dvec3_to_array(v: DVec3) -> [f64; 3] {
-    [v.x, v.y, v.z]
-}
-
-fn array_to_dvec3(v: [f64; 3]) -> DVec3 {
-    DVec3::new(v[0], v[1], v[2])
-}
-
-pub(crate) fn build_active_dual_cubes(
-    samples: &SparseGrid3<f32>,
+fn build_active_dual_cubes_for_scalar(
+    samples: &CompactScalarGrid,
     sample_regions: &[Aabb3u],
 ) -> SparseGrid3<()> {
+    match samples {
+        CompactScalarGrid::F32(grid) => build_active_dual_cubes(grid, sample_regions),
+        CompactScalarGrid::F64(grid) => build_active_dual_cubes(grid, sample_regions),
+        CompactScalarGrid::UNorm32 { values, .. } => {
+            build_active_dual_cubes(values, sample_regions)
+        }
+    }
+}
+
+pub(crate) fn build_active_dual_cubes<T>(
+    samples: &SparseGrid3<T>,
+    sample_regions: &[Aabb3u],
+) -> SparseGrid3<()>
+where
+    T: Copy + PartialEq,
+{
     let sample_bounds = samples.bounds();
     let cube_bounds = UVec3::new(
         sample_bounds.x.saturating_sub(1),
@@ -1121,6 +1068,31 @@ pub(crate) fn build_active_dual_cubes(
         }
     });
     active
+}
+
+pub(crate) fn build_chunk_value_ranges(
+    samples: &CompactScalarGrid,
+    eligible_cubes: &SparseGrid3<()>,
+) -> Vec<ChunkValueRange> {
+    eligible_cubes
+        .chunk_aabbs()
+        .into_iter()
+        .filter_map(|aabb| {
+            let sample_max = UVec3::new(
+                aabb.max.x.saturating_add(1).min(samples.bounds().x),
+                aabb.max.y.saturating_add(1).min(samples.bounds().y),
+                aabb.max.z.saturating_add(1).min(samples.bounds().z),
+            );
+            let sample_aabb = Aabb3u::new(aabb.min, sample_max);
+            let mut min = f64::INFINITY;
+            let mut max = f64::NEG_INFINITY;
+            samples.for_each_value_in_aabb(sample_aabb, |_, value| {
+                min = min.min(value);
+                max = max.max(value);
+            });
+            (min <= max).then_some(ChunkValueRange { aabb, min, max })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1179,11 +1151,11 @@ mod tests {
                 &plotfile,
                 CompactOptions {
                     component_ids: vec![0],
-                    normalizations: vec![CompactNormalization {
+                    encodings: vec![CompactComponentEncoding {
                         component_id: 0,
-                        min,
-                        max,
+                        encoding: CompactScalarEncoding::UNorm32 { min, max },
                     }],
+                    ..CompactOptions::default()
                 },
                 &mut bytes,
             )?;
@@ -1213,6 +1185,134 @@ mod tests {
     }
 
     #[test]
+    fn f64_archive_preserves_large_offset_detail_for_isosurfacing() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("amrex_rs_compact_f64_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let base = 1.0e20;
+        let step = 1.0e10;
+        write_single_cube_plotfile_values(
+            &root,
+            std::array::from_fn(|index| base + (index % 2) as f64 * step),
+        )?;
+
+        let result = (|| -> Result<()> {
+            let plotfile = PlotFile::open(&root)?;
+            let mut bytes = Vec::new();
+            write_compact(
+                &plotfile,
+                CompactOptions {
+                    component_ids: vec![0],
+                    encodings: vec![CompactComponentEncoding {
+                        component_id: 0,
+                        encoding: CompactScalarEncoding::F64,
+                    }],
+                    ..CompactOptions::default()
+                },
+                &mut bytes,
+            )?;
+
+            let compact = read_compact(&bytes)?;
+            ensure!(
+                compact.component_encoding(0) == Some(CompactScalarEncoding::F64),
+                "f64 encoding metadata was not preserved"
+            );
+            let stats = compact.component_stats(0).context("missing component")?;
+            ensure!(stats.min == Some(base), "f64 minimum lost precision");
+            ensure!(stats.max == Some(base + step), "f64 maximum lost precision");
+
+            let (mesh, _) = crate::isosurface_compact(
+                &compact,
+                crate::IsosurfaceOptions {
+                    surface: crate::Surface {
+                        id: 0,
+                        value: base + 0.5 * step,
+                    },
+                    ..crate::IsosurfaceOptions::default()
+                },
+            )?;
+            ensure!(
+                !mesh.indices.is_empty(),
+                "f64 detail did not produce a surface"
+            );
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&root);
+        result
+    }
+
+    #[test]
+    fn chunk_value_ranges_include_positive_sample_halo() {
+        let mut samples = SparseGrid3::new(UVec3::new(34, 2, 2));
+        samples.fill_aabb(samples.bounds_aabb(), 0.0_f64);
+        samples.fill_aabb(Aabb3u::new(UVec3::new(32, 0, 0), samples.bounds()), 1.0);
+        let mut cubes = SparseGrid3::new(UVec3::new(33, 1, 1));
+        cubes.fill_aabb(cubes.bounds_aabb(), ());
+        let ranges = build_chunk_value_ranges(&CompactScalarGrid::F64(samples), &cubes);
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!((ranges[0].min, ranges[0].max), (0.0, 1.0));
+        assert_eq!((ranges[1].min, ranges[1].max), (1.0, 1.0));
+    }
+
+    #[test]
+    fn compaction_reports_and_flattens_non_finite_values() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "amrex_rs_compact_nonfinite_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        write_single_cube_plotfile_values(
+            &root,
+            [
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                3.0,
+                4.0,
+                5.0,
+                6.0,
+                7.0,
+            ],
+        )?;
+
+        let result = (|| -> Result<()> {
+            let plotfile = PlotFile::open(&root)?;
+            let mut bytes = Vec::new();
+            let written = write_compact(
+                &plotfile,
+                CompactOptions {
+                    component_ids: vec![0],
+                    encodings: vec![CompactComponentEncoding {
+                        component_id: 0,
+                        encoding: CompactScalarEncoding::F64,
+                    }],
+                    ..CompactOptions::default()
+                },
+                &mut bytes,
+            )?;
+            ensure!(
+                written.non_finite_replacements
+                    == vec![NonFiniteReplacement {
+                        component_id: 0,
+                        count: 3,
+                    }],
+                "unexpected non-finite replacement report"
+            );
+            let stats = read_compact(&bytes)?
+                .component_stats(0)
+                .context("missing component")?;
+            ensure!(stats.nan_count == 0, "non-finite value survived compaction");
+            ensure!(stats.min == Some(0.0) && stats.max == Some(7.0));
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&root);
+        result
+    }
+
+    #[test]
     fn writes_compact_archive() -> Result<()> {
         let root =
             std::env::temp_dir().join(format!("amrex_rs_compact_test_{}", std::process::id()));
@@ -1224,6 +1324,16 @@ mod tests {
             let mut bytes = Vec::new();
             write_compact(&plotfile, CompactOptions::default(), &mut bytes)?;
             ensure!(!bytes.is_empty(), "compact archive is empty");
+            ensure!(
+                bytes[..4] == FORMAT_MAGIC.to_le_bytes()
+                    && bytes[4..8] == FORMAT_VERSION.to_le_bytes(),
+                "compact archive prefix changed"
+            );
+            let header_offset = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
+            ensure!(
+                header_offset.is_multiple_of(8),
+                "compact header is not aligned"
+            );
 
             let view = view_compact(&bytes)?;
             ensure!(
@@ -1300,9 +1410,7 @@ mod tests {
             ensure!(!mesh.positions.is_empty(), "expected extracted vertices");
             ensure!(!mesh.indices.is_empty(), "expected extracted faces");
 
-            // SAFETY: `bytes` were produced immediately above and remain
-            // immutable for the duration of the selective read.
-            let selected = unsafe { read_compact_selected_unchecked(&bytes, &[0])? };
+            let selected = read_compact_selected(&bytes, &[0])?;
             let (selected_mesh, _) = crate::isosurface_compact(
                 &selected,
                 crate::IsosurfaceOptions {

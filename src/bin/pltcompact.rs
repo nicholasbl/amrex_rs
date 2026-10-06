@@ -5,7 +5,10 @@ use std::{
     path::PathBuf,
 };
 
-use amrex_rs::{CompactNormalization, CompactOptions, PlotFile, write_compact};
+use amrex_rs::{
+    CompactComponentEncoding, CompactOptions, CompactScalarEncoding, NonFinitePolicy, PlotFile,
+    write_compact,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
@@ -16,7 +19,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("opening plotfile {}", args.input.display()))?;
 
     let mut ids = Vec::with_capacity(args.variables.len());
-    let mut normalizations = Vec::new();
+    let mut encodings = Vec::new();
     for requested in args.variables {
         let variable = plotfile
             .variable(&requested.name)
@@ -28,13 +31,27 @@ fn main() -> Result<()> {
             requested.name
         );
         ids.push(component_id);
-        if let Some([min, max]) = requested.normalize {
-            normalizations.push(CompactNormalization {
-                component_id,
-                min,
-                max,
-            });
-        }
+        let encoding = match (requested.encoding, requested.normalize) {
+            (None | Some(ConfigEncoding::F32), None) => CompactScalarEncoding::F32,
+            (Some(ConfigEncoding::F64), None) => CompactScalarEncoding::F64,
+            (None | Some(ConfigEncoding::UNorm32), Some([min, max])) => {
+                CompactScalarEncoding::UNorm32 { min, max }
+            }
+            (Some(ConfigEncoding::UNorm32), None) => {
+                bail!(
+                    "variable {:?} uses unorm32 but has no normalize bounds",
+                    requested.name
+                )
+            }
+            (Some(encoding), Some(_)) => bail!(
+                "variable {:?} has normalize bounds incompatible with {encoding:?}",
+                requested.name
+            ),
+        };
+        encodings.push(CompactComponentEncoding {
+            component_id,
+            encoding,
+        });
     }
 
     let file = File::create(&args.output)
@@ -45,7 +62,12 @@ fn main() -> Result<()> {
         &plotfile,
         CompactOptions {
             component_ids: ids,
-            normalizations,
+            encodings,
+            non_finite_policy: if args.assume_finite {
+                NonFinitePolicy::AssumeFinite
+            } else {
+                NonFinitePolicy::ReplaceWithZero
+            },
         },
         &mut writer,
     )
@@ -60,6 +82,16 @@ fn main() -> Result<()> {
         timings.archive_time.as_secs_f32(),
         timings.serialization_time.as_secs_f32()
     );
+    for replacement in timings.non_finite_replacements {
+        let name = plotfile
+            .variables()
+            .get(replacement.component_id as usize)
+            .map_or("<unknown>", |variable| variable.name.as_str());
+        eprintln!(
+            "warning: replaced {} non-finite or unrepresentable values with zero in {name:?}",
+            replacement.count
+        );
+    }
 
     Ok(())
 }
@@ -68,6 +100,7 @@ struct Args {
     input: PathBuf,
     output: PathBuf,
     variables: Vec<VariableConfig>,
+    assume_finite: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,13 +110,24 @@ struct Config {
     output: Option<PathBuf>,
     #[serde(default)]
     variables: Vec<VariableConfig>,
+    #[serde(default)]
+    assume_finite: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VariableConfig {
     name: String,
+    encoding: Option<ConfigEncoding>,
     normalize: Option<[f64; 2]>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ConfigEncoding {
+    F32,
+    F64,
+    UNorm32,
 }
 
 impl Args {
@@ -119,6 +163,7 @@ impl Args {
                 input,
                 output,
                 variables: config.variables,
+                assume_finite: config.assume_finite,
             });
         }
 
@@ -137,9 +182,11 @@ impl Args {
                 .into_iter()
                 .map(|name| VariableConfig {
                     name,
+                    encoding: None,
                     normalize: None,
                 })
                 .collect(),
+            assume_finite: false,
         })
     }
 }
@@ -154,13 +201,16 @@ mod tests {
             r#"
                 input = "plt00010"
                 output = "plt00010.compact"
+                assume_finite = true
 
                 [[variables]]
                 name = "density"
+                encoding = "unorm32"
                 normalize = [1.0e20, 1.000000001e20]
 
                 [[variables]]
                 name = "temperature"
+                encoding = "f64"
             "#,
         )?;
 
@@ -180,6 +230,12 @@ mod tests {
         ensure!(
             config.variables[1].normalize.is_none(),
             "optional normalization unexpectedly present"
+        );
+        ensure!(config.assume_finite, "assume_finite changed while parsing");
+        ensure!(
+            matches!(config.variables[0].encoding, Some(ConfigEncoding::UNorm32))
+                && matches!(config.variables[1].encoding, Some(ConfigEncoding::F64)),
+            "scalar encodings changed while parsing"
         );
         Ok(())
     }

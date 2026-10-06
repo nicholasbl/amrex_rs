@@ -122,6 +122,21 @@ println!(
     result.decimation.original_face_count,
     result.decimation.final_face_count
 );
+println!(
+    "dedup {:?}, degenerates {:?}, pre-compact {:?}, decimate {:?}, total {:?}",
+    result.timings.deduplication,
+    result.timings.degenerate_removal,
+    result.timings.pre_decimation_compaction,
+    result.timings.decimation,
+    result.timings.total,
+);
+println!(
+    "meshoptimizer {:?}, validation {:?} + {:?}, post-compact {:?}",
+    result.decimation.timings.simplification,
+    result.decimation.timings.input_validation,
+    result.decimation.timings.output_validation,
+    result.decimation.timings.compaction,
+);
 ```
 
 Use `decimate_mesh` directly when the mesh is already welded and free of
@@ -192,16 +207,19 @@ println!("original variable count = {}", compact.variable_count());
 An empty `component_ids` list selects all variables. Otherwise, component IDs are
 the zero-based indices exposed by `PlotFile::variables()`.
 
-For per-variable normalization, pass a reusable TOML configuration to
-`pltcompact`:
+For per-variable storage, pass a reusable TOML configuration to `pltcompact`.
+Quantities default to `f32`; `f64` retains genuine double precision, while
+`unorm32` maps one global physical range to all 32 bits of an unsigned integer:
 
 ```toml
 [[variables]]
 name = "density"
+encoding = "unorm32"
 normalize = [1.0e20, 1.000000001e20]
 
 [[variables]]
 name = "temperature"
+encoding = "f64"
 ```
 
 ```sh
@@ -214,17 +232,26 @@ This lets the same variable recipe be reused across a collection of plotfiles.
 `--config compact.toml` form used. When command-line paths are supplied, they
 override the paths from the TOML.
 
-Each normalized quantity is transformed in `f64` as
-`clamp((value - min) / (max - min), 0, 1)` before conversion to the archive's
-`f32` storage. Its original bounds are retained in archive metadata and shown by
-the `probe` binary. Isovalues for normalized quantities must likewise be in the
-normalized `[0, 1]` range. Omitting `variables` selects every quantity without
-normalization.
+For backward-compatible configs, `normalize` without an explicit `encoding`
+implies `unorm32`. Quantization is performed in `f64` as
+`round(clamp((value - min) / (max - min), 0, 1) * u32::MAX)`. The original
+bounds are retained in archive metadata and shown by `probe`. Isovalues for
+normalized quantities must likewise be in the normalized `[0, 1]` range.
+Omitting `variables` selects every quantity as `f32`.
+
+By default, compaction replaces non-finite or non-representable values with
+zero and prints aggregate warnings. Set `assume_finite = true` at the top level
+of a trusted config to skip those checks. Input and output may be supplied in
+the config or overridden on the command line.
 
 ## Notes
 
-Isosurface extraction expects cell-centered data. The mesh path uses a sparse chunked grid internally, with cached accessors in the MC33 hot path to avoid repeated hash-map lookups inside the same chunk.
+Isosurface extraction expects cell-centered data. Compact archives contain a
+conservative min/max range for each sparse work chunk, including the positive
+sample halo. Chunks that cannot contain the requested isovalue are rejected
+before MC33 visits individual cubes. Scalar calculations remain in `f64`; final
+mesh positions and UVs are stored as `f32` for graphics use.
 
 The compact archive format is intended for use by this crate and may change before a stable 1.0 release.
-Archives containing normalization metadata use format version 2; version 1 archives
-must be regenerated with the current `pltcompact`.
+The current offset-based format is version 3. Earlier archives must be
+regenerated with the current `pltcompact`.

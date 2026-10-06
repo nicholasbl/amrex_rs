@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use glam::{DVec3, I64Vec3, IVec3, UVec3};
 
-use crate::utility::{Aabb3u, SparseGrid3};
+use crate::compact::scalar::CompactScalarGrid;
+use crate::compact::{CompactScalarEncoding, NonFinitePolicy};
+use crate::utility::Aabb3u;
 use crate::{DataReader, IndexDomain, Level, Patch, PlotFile};
 
 /// Sparse, cell-centered component data for an AMR hierarchy.
@@ -10,6 +12,7 @@ use crate::{DataReader, IndexDomain, Level, Patch, PlotFile};
 /// the same order as `component_ids` and coordinates local to `index_origin`.
 pub(crate) struct SparseAmr {
     pub(crate) component_ids: Vec<usize>,
+    pub(crate) non_finite_replacements: Vec<usize>,
     pub(crate) levels: Vec<SparseAmrLevel>,
 }
 
@@ -19,7 +22,8 @@ pub(crate) struct SparseAmrLevel {
     pub(crate) index_type: IVec3,
     pub(crate) physical_origin: DVec3,
     pub(crate) cell_size: DVec3,
-    pub(crate) components: Vec<SparseGrid3<f32>>,
+    pub(crate) components: Vec<CompactScalarGrid>,
+    pub(crate) non_finite_replacements: Vec<usize>,
     pub(crate) valid_regions: Vec<Aabb3u>,
 }
 
@@ -27,11 +31,12 @@ impl SparseAmr {
     pub(crate) fn load(
         plot_file: &PlotFile,
         component_ids: &[usize],
-        normalizations: &[Option<(f64, f64)>],
+        encodings: &[CompactScalarEncoding],
+        non_finite_policy: NonFinitePolicy,
     ) -> Result<Self> {
         ensure!(
-            component_ids.len() == normalizations.len(),
-            "component and normalization counts differ"
+            component_ids.len() == encodings.len(),
+            "component and encoding counts differ"
         );
         for &component in component_ids {
             ensure!(
@@ -49,14 +54,26 @@ impl SparseAmr {
                     level,
                     plot_file.header().domain.min,
                     component_ids,
-                    normalizations,
+                    encodings,
+                    non_finite_policy,
                 )
                 .with_context(|| format!("loading sparse AMR level {}", level.index()))
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let mut non_finite_replacements = vec![0; component_ids.len()];
+        for level in &levels {
+            for (total, &count) in non_finite_replacements
+                .iter_mut()
+                .zip(&level.non_finite_replacements)
+            {
+                *total += count;
+            }
+        }
+
         Ok(Self {
             component_ids: component_ids.to_vec(),
+            non_finite_replacements,
             levels,
         })
     }
@@ -67,14 +84,16 @@ fn load_level(
     level: Level<'_>,
     physical_origin: DVec3,
     component_ids: &[usize],
-    normalizations: &[Option<(f64, f64)>],
+    encodings: &[CompactScalarEncoding],
+    non_finite_policy: NonFinitePolicy,
 ) -> Result<SparseAmrLevel> {
     let domain = level.index_domain();
     let bounds = index_extent(domain)?;
-    let mut components = component_ids
+    let mut components = encodings
         .iter()
-        .map(|_| SparseGrid3::with_chunk_capacity(bounds, level.patch_count()))
+        .map(|&encoding| CompactScalarGrid::new(bounds, level.patch_count(), encoding))
         .collect::<Vec<_>>();
+    let mut non_finite_replacements = vec![0; component_ids.len()];
     let mut valid_regions = Vec::with_capacity(level.patch_count());
 
     for patch in level.patches()? {
@@ -86,18 +105,18 @@ fn load_level(
         );
 
         let local_aabb = local_aabb(patch_box, domain)?;
-        for ((&component, &normalization), destination) in component_ids
+        for ((&component, destination), replacement_count) in component_ids
             .iter()
-            .zip(normalizations)
             .zip(&mut components)
+            .zip(&mut non_finite_replacements)
         {
-            load_patch_component(
+            *replacement_count += load_patch_component(
                 reader,
                 patch,
                 component,
-                normalization,
                 local_aabb,
                 destination,
+                non_finite_policy,
             )?;
         }
         valid_regions.push(local_aabb);
@@ -110,6 +129,7 @@ fn load_level(
         physical_origin,
         cell_size: level.cell_size(),
         components,
+        non_finite_replacements,
         valid_regions,
     })
 }
@@ -118,10 +138,10 @@ fn load_patch_component(
     reader: &DataReader<'_>,
     patch: Patch<'_>,
     component: usize,
-    normalization: Option<(f64, f64)>,
     local_aabb: Aabb3u,
-    destination: &mut SparseGrid3<f32>,
-) -> Result<()> {
+    destination: &mut CompactScalarGrid,
+    non_finite_policy: NonFinitePolicy,
+) -> Result<usize> {
     let patch_box = patch.index_box();
     let view = reader.component(patch, component)?;
     let value_count = local_aabb
@@ -140,18 +160,14 @@ fn load_patch_component(
                         patch.index()
                     )
                 })?;
-                let value = match normalization {
-                    Some((min, max)) => ((value - min) / (max - min)).clamp(0.0, 1.0),
-                    None => value,
-                };
-                values.push(value as f32);
+                values.push(value);
             }
         }
     }
 
     destination
-        .write_aabb_values(local_aabb, &values)
-        .map_err(|error| anyhow::anyhow!("writing patch component {component}: {error:?}"))
+        .write_physical_values(local_aabb, &values, non_finite_policy)
+        .with_context(|| format!("writing patch component {component}"))
 }
 
 fn index_extent(domain: &IndexDomain) -> Result<UVec3> {

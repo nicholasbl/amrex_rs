@@ -1,17 +1,17 @@
 use anyhow::{Context, Result, ensure};
 use glam::{U16Vec2, UVec3};
 
-use crate::utility::GridAccessor;
+use crate::compact::CompactScalarAccessor;
 
 use super::SampleRange;
 
 /// Interpolate auxiliary quantities along the same edge and with the same
 /// parameter used to place an isosurface vertex.
 pub(super) fn sampled_values_on_edge(
-    sampled_quantities: &mut [GridAccessor<'_, f32>],
+    sampled_quantities: &mut [CompactScalarAccessor<'_>],
     start: UVec3,
     end: UVec3,
-    t: f32,
+    t: f64,
     ranges: &[SampleRange],
 ) -> Result<U16Vec2> {
     encode_sampled_values(sampled_quantities, ranges, |grid| {
@@ -27,7 +27,7 @@ pub(super) fn sampled_values_on_edge(
 
 /// Blend auxiliary quantities using the weights of an MC33 interior vertex.
 pub(super) fn sampled_values_weighted(
-    sampled_quantities: &mut [GridAccessor<'_, f32>],
+    sampled_quantities: &mut [CompactScalarAccessor<'_>],
     positions: &[UVec3; 8],
     weights: &[f64; 8],
     ranges: &[SampleRange],
@@ -40,19 +40,19 @@ pub(super) fn sampled_values_weighted(
             let sample = grid.get(position).with_context(|| {
                 format!("sample value is absent at MC33 interior vertex corner {position:?}")
             })?;
-            value += f64::from(sample) * weight;
+            value += sample * weight;
         }
-        Ok((value / weight_sum) as f32)
+        Ok(value / weight_sum)
     })
 }
 
 fn encode_sampled_values<F>(
-    sampled_quantities: &mut [GridAccessor<'_, f32>],
+    sampled_quantities: &mut [CompactScalarAccessor<'_>],
     ranges: &[SampleRange],
     mut value: F,
 ) -> Result<U16Vec2>
 where
-    F: FnMut(&mut GridAccessor<'_, f32>) -> Result<f32>,
+    F: FnMut(&mut CompactScalarAccessor<'_>) -> Result<f64>,
 {
     ensure!(
         sampled_quantities.len() == ranges.len(),
@@ -67,7 +67,7 @@ where
     Ok(U16Vec2::new(encoded[0], encoded[1]))
 }
 
-fn encode_unorm16(value: f32, range: SampleRange) -> u16 {
-    let normalized = ((f64::from(value) - range.min) / (range.max - range.min)).clamp(0.0, 1.0);
+fn encode_unorm16(value: f64, range: SampleRange) -> u16 {
+    let normalized = ((value - range.min) / (range.max - range.min)).clamp(0.0, 1.0);
     (normalized * f64::from(u16::MAX)).round() as u16
 }

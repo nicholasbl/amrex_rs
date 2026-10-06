@@ -5,7 +5,7 @@ use glam::DVec3;
 use glam::IVec3;
 
 use crate::PlotFile;
-use crate::compact::CompactPlot;
+use crate::compact::{ChunkValueRange, CompactPlot, CompactScalarGrid};
 use crate::sparse_amr::level_translation;
 use crate::utility::SparseGrid3;
 
@@ -21,9 +21,10 @@ pub(crate) struct DualGridLevel<'a> {
     pub(crate) index_origin: IVec3,
     pub(crate) physical_origin: DVec3,
     pub(crate) cell_size: DVec3,
-    pub(crate) samples: &'a SparseGrid3<f32>,
-    pub(crate) sampled_quantities: Vec<&'a SparseGrid3<f32>>,
+    pub(crate) samples: &'a CompactScalarGrid,
+    pub(crate) sampled_quantities: Vec<&'a CompactScalarGrid>,
     pub(crate) active_cubes: SparseGrid3<()>,
+    pub(crate) value_ranges: &'a [ChunkValueRange],
 }
 
 /// Build the isosurface-specific dual lattice from reusable sparse AMR data.
@@ -99,9 +100,7 @@ pub(super) fn dual_grid_levels_from_compact<'a>(
             let translation =
                 level_translation(coarse.index_origin, compact_level.index_origin, ratio)?;
 
-            coarse
-                .active_cubes
-                .mask_out_by_presence_scaled(samples, ratio, translation);
+            samples.mask_out_by_presence_scaled(&mut coarse.active_cubes, ratio, translation);
         }
 
         levels.push(DualGridLevel {
@@ -120,6 +119,10 @@ pub(super) fn dual_grid_levels_from_compact<'a>(
                 })
                 .collect::<Result<Vec<_>>>()?,
             active_cubes: compact_level.eligible_cubes.clone(),
+            value_ranges: compact_level
+                .value_ranges
+                .get(surface_slot)
+                .context("surface value ranges are absent from compact level")?,
         });
     }
 

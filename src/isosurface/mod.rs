@@ -26,7 +26,7 @@ use dual_grid::{dual_grid_levels_from_compact, load_compact_for_isosurface};
 pub struct Surface {
     /// Component id in the plotfile variable list.
     pub id: u32,
-    /// Isovalue in the component's native units.
+    /// Isovalue in stored units (`[0, 1]` for a UNorm32 component).
     pub value: f64,
 }
 
@@ -359,15 +359,14 @@ fn validate_sample_specs_for_len(
 fn validate_isosurface_options(
     variable_count: usize,
     options: &IsosurfaceOptions,
-) -> Result<(usize, f32, Vec<SampleSpec>)> {
+) -> Result<(usize, f64, Vec<SampleSpec>)> {
     let component = usize::try_from(options.surface.id).context("surface id is too large")?;
     ensure!(
         component < variable_count,
         "surface component index {component} is out of range"
     );
     ensure!(options.surface.value.is_finite(), "isovalue must be finite");
-    let isovalue = options.surface.value as f32;
-    ensure!(isovalue.is_finite(), "isovalue does not fit in f32");
+    let isovalue = options.surface.value;
     if let Some(levels) = &options.levels {
         ensure!(
             levels.start() <= levels.end(),
@@ -503,9 +502,14 @@ pub fn isosurface_compact(
 fn mesh_level_parallel(
     level: &dual_grid::DualGridLevel<'_>,
     ranges: &[SampleRange],
-    isovalue: f32,
+    isovalue: f64,
 ) -> Result<Mesh3D> {
-    let chunk_aabbs = level.active_cubes.chunk_aabbs();
+    let chunk_aabbs = level
+        .value_ranges
+        .iter()
+        .filter(|range| range.min <= isovalue && isovalue < range.max)
+        .map(|range| range.aabb)
+        .collect::<Vec<_>>();
     let mut chunks = chunk_aabbs
         .into_par_iter()
         .map(|active_aabb| {

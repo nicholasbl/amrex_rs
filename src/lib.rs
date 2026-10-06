@@ -12,14 +12,17 @@ pub mod slice;
 pub(crate) mod sparse_amr;
 pub mod utility;
 
+#[allow(deprecated)]
+pub use compact::read_compact_selected_unchecked;
 pub use compact::{
-    CompactArchiveView, CompactComponentStats, CompactNormalization, CompactOptions, CompactPlot,
-    read_compact, read_compact_selected_unchecked, view_compact, view_compact_unchecked,
-    write_compact,
+    CompactArchiveView, CompactComponentEncoding, CompactComponentStats, CompactOptions,
+    CompactPlot, CompactScalarEncoding, NonFinitePolicy, NonFiniteReplacement, read_compact,
+    read_compact_selected, view_compact, view_compact_unchecked, write_compact,
 };
 pub use decimate::{
     DecimateErrorMode, DecimateOptions, DecimatePipelineOptions, DecimatePipelineResult,
-    DecimateResult, DecimateTarget, decimate_mesh, decimate_mesh_pipeline,
+    DecimatePipelineTimings, DecimateResult, DecimateTarget, DecimateTimings, decimate_mesh,
+    decimate_mesh_pipeline,
 };
 pub use isosurface::{
     DedupMeshOptions, IsosurfaceOptions, Mesh3D, RemoveDegenerateTrianglesOptions, Sample, Surface,

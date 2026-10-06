@@ -1,6 +1,6 @@
 use std::{env, fs::File, path::PathBuf};
 
-use amrex_rs::{CompactComponentStats, read_compact, view_compact};
+use amrex_rs::{CompactComponentStats, CompactScalarEncoding, read_compact, view_compact};
 use anyhow::{Context, Result, ensure};
 
 fn usage(program: &str) -> String {
@@ -117,8 +117,14 @@ fn main() -> Result<()> {
             .component_normalization(component_id)
             .map(|(min, max)| format!(", normalized from [{min:.7e}, {max:.7e}]"))
             .unwrap_or_default();
+        let encoding = match compact.component_encoding(component_id) {
+            Some(CompactScalarEncoding::F32) => "f32",
+            Some(CompactScalarEncoding::F64) => "f64",
+            Some(CompactScalarEncoding::UNorm32 { .. }) => "unorm32",
+            None => "unknown",
+        };
         println!(
-            "  [{component_id:>3}] {:<24} {} values={}{nan_suffix}{normalization_suffix}",
+            "  [{component_id:>3}] {:<24} {} values={} encoding={encoding}{nan_suffix}{normalization_suffix}",
             variable.name,
             format_range(stats),
             stats.value_count

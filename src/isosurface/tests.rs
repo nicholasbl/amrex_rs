@@ -4,13 +4,14 @@ use super::dual_grid::{DualGridLevel, build_active_dual_cubes};
 use super::mc33::mesh_level_aabb as mesh_level_mc33_aabb;
 use super::sampling::sampled_values_on_edge;
 use super::*;
+use crate::compact::{CompactScalarEncoding, CompactScalarGrid};
 use crate::sparse_amr::level_translation;
 use crate::utility::{Aabb3u, SparseGrid3};
 use glam::{DVec3, I64Vec3, IVec3, U16Vec2, UVec3, Vec3};
 
 fn level_with_grids<'a>(
-    samples: &'a SparseGrid3<f32>,
-    sampled_quantities: Vec<&'a SparseGrid3<f32>>,
+    samples: &'a CompactScalarGrid,
+    sampled_quantities: Vec<&'a CompactScalarGrid>,
     active_cubes: &'a SparseGrid3<()>,
 ) -> DualGridLevel<'a> {
     DualGridLevel {
@@ -21,6 +22,7 @@ fn level_with_grids<'a>(
         samples,
         sampled_quantities,
         active_cubes: active_cubes.clone(),
+        value_ranges: &[],
     }
 }
 
@@ -92,7 +94,9 @@ fn edge_samples_are_interpolated_normalized_and_encoded_as_uv() {
     let mut v = SparseGrid3::new(UVec3::new(2, 1, 1));
     v.set(UVec3::ZERO, -5.0);
     v.set(UVec3::X, 15.0);
-    let samples = SparseGrid3::new(UVec3::new(2, 1, 1));
+    let samples = CompactScalarGrid::F32(SparseGrid3::new(UVec3::new(2, 1, 1)));
+    let u = CompactScalarGrid::F32(u);
+    let v = CompactScalarGrid::F32(v);
     let active_cubes = SparseGrid3::new(UVec3::ZERO);
     let level = level_with_grids(&samples, vec![&u, &v], &active_cubes);
     let ranges = [
@@ -134,6 +138,7 @@ fn mc33_extracts_a_plane_without_tetrahedral_diagonals() {
     }
     let mut active_cubes = SparseGrid3::new(UVec3::ONE);
     active_cubes.set(UVec3::ZERO, ());
+    let samples = CompactScalarGrid::F32(samples);
     let level = level_with_grids(&samples, Vec::new(), &active_cubes);
 
     let mut mesh = Mesh3D::default();
@@ -174,20 +179,25 @@ fn public_mesher_extracts_across_active_chunks() -> Result<()> {
     }
     let mut active_cubes = SparseGrid3::new(UVec3::new(33, 1, 1));
     active_cubes.fill_aabb(active_cubes.bounds_aabb(), ());
-    let level = level_with_grids(&samples, Vec::new(), &active_cubes);
+    let scalar_samples = CompactScalarGrid::F32(samples.clone());
+    let level = level_with_grids(&scalar_samples, Vec::new(), &active_cubes);
     let compact = CompactPlot {
         simulation_time: 0.0,
         variables: Vec::new(),
         variable_count: 1,
         refinement_ratios: Vec::new(),
         component_ids: vec![0],
-        normalizations: Vec::new(),
+        encodings: vec![CompactScalarEncoding::F32],
         levels: vec![crate::compact::CompactLevel {
             level_index: 0,
             index_origin: IVec3::ZERO,
             physical_origin: level.physical_origin,
             cell_size: level.cell_size,
-            components: vec![samples],
+            value_ranges: vec![crate::compact::build_chunk_value_ranges(
+                &CompactScalarGrid::F32(samples.clone()),
+                &active_cubes,
+            )],
+            components: vec![CompactScalarGrid::F32(samples)],
             eligible_cubes: active_cubes,
         }],
     };
@@ -475,13 +485,17 @@ fn single_plane_compact() -> CompactPlot {
         variable_count: 1,
         refinement_ratios: Vec::new(),
         component_ids: vec![0],
-        normalizations: Vec::new(),
+        encodings: vec![CompactScalarEncoding::F32],
         levels: vec![crate::compact::CompactLevel {
             level_index: 0,
             index_origin: IVec3::ZERO,
             physical_origin: DVec3::ZERO,
             cell_size: DVec3::ONE,
-            components: vec![samples],
+            value_ranges: vec![crate::compact::build_chunk_value_ranges(
+                &CompactScalarGrid::F32(samples.clone()),
+                &active_cubes,
+            )],
+            components: vec![CompactScalarGrid::F32(samples)],
             eligible_cubes: active_cubes,
         }],
     }
