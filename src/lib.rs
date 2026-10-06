@@ -20,9 +20,9 @@ pub use compact::{
     read_compact_selected, view_compact, view_compact_unchecked, write_compact,
 };
 pub use decimate::{
-    DecimateErrorMode, DecimateOptions, DecimatePipelineOptions, DecimatePipelineResult,
-    DecimatePipelineTimings, DecimateResult, DecimateTarget, DecimateTimings, decimate_mesh,
-    decimate_mesh_pipeline,
+    DecimateErrorMode, DecimateOptions, DecimateParallelOptions, DecimatePipelineOptions,
+    DecimatePipelineResult, DecimatePipelineTimings, DecimateResult, DecimateTarget,
+    DecimateTimings, decimate_mesh, decimate_mesh_pipeline,
 };
 pub use isosurface::{
     DedupMeshOptions, IsosurfaceOptions, Mesh3D, RemoveDegenerateTrianglesOptions, Sample, Surface,

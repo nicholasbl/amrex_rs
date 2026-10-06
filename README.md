@@ -131,8 +131,10 @@ println!(
     result.timings.total,
 );
 println!(
-    "meshoptimizer {:?}, validation {:?} + {:?}, post-compact {:?}",
+    "meshoptimizer {:?}, groups {} ({} faces before final), validation {:?} + {:?}, post-compact {:?}",
     result.decimation.timings.simplification,
+    result.decimation.group_count,
+    result.decimation.intermediate_face_count,
     result.decimation.timings.input_validation,
     result.decimation.timings.output_validation,
     result.decimation.timings.compaction,
@@ -142,6 +144,15 @@ println!(
 Use `decimate_mesh` directly when the mesh is already welded and free of
 degenerate triangles. Error limits can be relative to mesh extent or absolute
 in the physical units used by `Mesh3D::positions`.
+
+Large meshes use a topology-aware parallel path by default. Meshlets seed
+larger connected partitions; Rayon simplifies those partitions with locked
+borders, then a final sparse global pass removes the temporary partition
+boundaries. Configure the threshold and group sizes through
+`DecimateParallelOptions`, or set `DecimateOptions::parallel` to `None` to force
+the original serial path. Detailed timings are available in `DecimateTimings`
+for meshlet construction, partitioning, grouped simplification, merging, and
+the final global simplification.
 
 ## Compact Archives
 
