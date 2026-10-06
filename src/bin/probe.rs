@@ -35,6 +35,57 @@ fn format_range(stats: CompactComponentStats) -> String {
     }
 }
 
+fn format_bytes(bytes: u128) -> String {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {} ({bytes} bytes)", UNITS[unit])
+    }
+}
+
+fn scalar_width(encoding: CompactScalarEncoding) -> u128 {
+    match encoding {
+        CompactScalarEncoding::F32 | CompactScalarEncoding::UNorm32 { .. } => 4,
+        CompactScalarEncoding::F64 => 8,
+    }
+}
+
+fn dense_scalar_payload_size(
+    index_domains: &[([i32; 3], [i32; 3], [i32; 3])],
+    encodings: &[CompactScalarEncoding],
+) -> Result<u128> {
+    let bytes_per_cell = encodings.iter().copied().map(scalar_width).sum::<u128>();
+    let mut total = 0_u128;
+
+    for (level, &(min, max, _)) in index_domains.iter().enumerate() {
+        let mut cell_count = 1_u128;
+        for axis in 0..3 {
+            let extent = i64::from(max[axis]) - i64::from(min[axis]) + 1;
+            ensure!(extent > 0, "level {level} has an empty index domain");
+            cell_count = cell_count
+                .checked_mul(extent as u128)
+                .context("dense cell count overflow")?;
+        }
+        total = total
+            .checked_add(
+                cell_count
+                    .checked_mul(bytes_per_cell)
+                    .context("dense level payload size overflow")?,
+            )
+            .context("dense payload size overflow")?;
+    }
+
+    Ok(total)
+}
+
 fn main() -> Result<()> {
     let Some(path) = parse_args()? else {
         return Ok(());
@@ -53,7 +104,7 @@ fn main() -> Result<()> {
 
     let (domain_min, domain_max) = view.domain();
     println!("archive: {}", path.display());
-    println!("size: {file_size} bytes");
+    println!("size: {}", format_bytes(u128::from(file_size)));
     println!("simulation time: {}", view.simulation_time());
     println!("coordinate system: {:?}", view.coordinate_system());
     println!(
@@ -64,6 +115,23 @@ fn main() -> Result<()> {
     println!("levels: {}", view.level_count());
 
     let index_domains = view.index_domains().collect::<Vec<_>>();
+    let component_encodings = view
+        .component_encodings()
+        .map(|(_, encoding)| encoding)
+        .collect::<Vec<_>>();
+    let dense_size = dense_scalar_payload_size(&index_domains, &component_encodings)?;
+    println!(
+        "dense scalar payload estimate: {}",
+        format_bytes(dense_size)
+    );
+    if dense_size > 0 {
+        let archive_fraction = file_size as f64 / dense_size as f64;
+        let dense_to_archive = dense_size as f64 / file_size as f64;
+        println!(
+            "archive / dense payload: {:.2}% (dense/archive: {dense_to_archive:.2}x)",
+            archive_fraction * 100.0
+        );
+    }
     let cell_sizes = view.cell_sizes().collect::<Vec<_>>();
     let level_steps = view.level_steps().collect::<Vec<_>>();
     for level in 0..view.level_count() {
@@ -132,4 +200,29 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_estimate_uses_inclusive_domains_and_encoding_widths() -> Result<()> {
+        let domains = [([0, 0, 0], [1, 2, 3], [0, 0, 0])];
+        let encodings = [
+            CompactScalarEncoding::F32,
+            CompactScalarEncoding::F64,
+            CompactScalarEncoding::UNorm32 { min: 0.0, max: 1.0 },
+        ];
+
+        // 2 * 3 * 4 cells, with 4 + 8 + 4 bytes per cell.
+        assert_eq!(dense_scalar_payload_size(&domains, &encodings)?, 384);
+        Ok(())
+    }
+
+    #[test]
+    fn byte_format_is_human_readable() {
+        assert_eq!(format_bytes(1000), "1000 B");
+        assert_eq!(format_bytes(1536), "1.50 KiB (1536 bytes)");
+    }
 }
