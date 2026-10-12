@@ -156,6 +156,28 @@ the original serial path. Detailed timings are available in `DecimateTimings`
 for meshlet construction, partitioning, grouped simplification, merging, and
 the final global simplification.
 
+## Vertex Relaxation
+
+Apply optional Taubin smoothing directly to any cleaned `Mesh3D`:
+
+```rust
+use amrex_rs::{VertexRelaxOptions, relax_mesh_vertices};
+
+let result = relax_mesh_vertices(&mut mesh, VertexRelaxOptions::default())?;
+println!(
+    "relaxed {} vertices ({} locked) in {:?}",
+    result.relaxed_vertex_count,
+    result.locked_vertex_count,
+    result.timings.total,
+);
+```
+
+Relaxation is deliberately separate from isosurface extraction and decimation,
+so callers can choose when to apply it. The default performs three
+shrinkage-resistant Taubin pass pairs, clamps each step relative to local edge
+length, locks open and non-manifold boundaries, and leaves UV/scientific values
+unchanged. Clean repeated-index faces before relaxing the mesh.
+
 ## Compact Archives
 
 The `pltcompact` binary converts an AMReX plotfile directory into a single compact

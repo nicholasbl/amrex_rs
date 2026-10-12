@@ -8,6 +8,7 @@ pub mod compact;
 pub mod decimate;
 mod input;
 pub mod isosurface;
+pub mod relax;
 pub mod slice;
 pub(crate) mod sparse_amr;
 pub mod utility;
@@ -28,6 +29,7 @@ pub use isosurface::{
     IsosurfaceOptions, Mesh3D, RemoveDegenerateTrianglesOptions, Sample, Surface, isosurface,
     isosurface_compact, remove_degenerate_triangles,
 };
+pub use relax::{VertexRelaxOptions, VertexRelaxResult, VertexRelaxTimings, relax_mesh_vertices};
 pub use slice::{SliceAxis, SliceOptions, SlicePlane, slice, slice_compact};
 
 pub use input::{
