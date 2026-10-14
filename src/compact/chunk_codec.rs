@@ -105,6 +105,24 @@ struct Candidate {
     payload: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+struct ErrorMetric {
+    absolute: f64,
+    relative_fraction: f64,
+    physical_offset: f64,
+    physical_scale: f64,
+}
+
+impl ErrorMetric {
+    fn accepts(self, original: f64, reconstructed: f64) -> bool {
+        let original = self.physical_offset + self.physical_scale * original;
+        let reconstructed = self.physical_offset + self.physical_scale * reconstructed;
+        let error = (original - reconstructed).abs();
+        let allowed = self.absolute + self.relative_fraction * original.abs();
+        error <= allowed
+    }
+}
+
 impl Candidate {
     fn stored_len(&self) -> usize {
         self.metadata.len() + self.payload.len()
@@ -136,12 +154,22 @@ fn encode_grid<T: Scalar>(
     grid: &SparseGrid3<T>,
     policy: ResolvedComponentCodec,
 ) -> Result<ArchiveScalarGrid> {
-    if let Some(error) = policy.max_abs_error {
+    if let Some(error) = policy.error_tolerance {
         ensure!(
-            error.is_finite() && error >= 0.0,
-            "maximum absolute chunk error must be finite and non-negative"
+            error.absolute.is_finite() && error.absolute >= 0.0,
+            "absolute chunk error must be finite and non-negative"
+        );
+        ensure!(
+            error.relative_percent.is_finite() && (0.0..=100.0).contains(&error.relative_percent),
+            "relative chunk error must be a finite percentage from 0 to 100"
         );
     }
+    ensure!(
+        policy.physical_offset.is_finite()
+            && policy.physical_scale.is_finite()
+            && policy.physical_scale > 0.0,
+        "invalid codec physical-domain transform"
+    );
 
     let mut result = Ok(());
     let mut chunks = Vec::with_capacity(grid.chunk_count());
@@ -211,8 +239,8 @@ fn select_candidate<T: Scalar>(
     match policy.selection {
         CompactChunkCodecSelection::AutoLossless => {
             ensure!(
-                policy.max_abs_error.is_none(),
-                "auto:lossless does not accept max_abs_error"
+                policy.error_tolerance.is_none(),
+                "auto:lossless does not accept an error tolerance"
             );
             Ok(dense_native_candidate(values))
         }
@@ -244,8 +272,8 @@ fn select_candidate<T: Scalar>(
             let candidate = match codec {
                 CompactChunkCodec::DenseF32 if T::TYPE == TYPE_F32 => {
                     ensure!(
-                        policy.max_abs_error.is_none(),
-                        "dense:f32 is exact for scalar_type f32 and does not accept max_abs_error"
+                        policy.error_tolerance.is_none(),
+                        "dense:f32 is exact for scalar_type f32 and does not accept an error tolerance"
                     );
                     Some(dense_native_candidate(values))
                 }
@@ -254,15 +282,15 @@ fn select_candidate<T: Scalar>(
                 }
                 CompactChunkCodec::DenseF64 if T::TYPE == TYPE_F64 => {
                     ensure!(
-                        policy.max_abs_error.is_none(),
-                        "dense:f64 is exact and does not accept max_abs_error"
+                        policy.error_tolerance.is_none(),
+                        "dense:f64 is exact and does not accept an error tolerance"
                     );
                     Some(dense_native_candidate(values))
                 }
                 CompactChunkCodec::DenseU32 if T::TYPE == TYPE_UNORM32 => {
                     ensure!(
-                        policy.max_abs_error.is_none(),
-                        "dense:u32 is exact for scalar_type unorm32 and does not accept max_abs_error"
+                        policy.error_tolerance.is_none(),
+                        "dense:u32 is exact for scalar_type unorm32 and does not accept an error tolerance"
                     );
                     Some(dense_native_candidate(values))
                 }
@@ -307,7 +335,7 @@ fn select_candidate<T: Scalar>(
             };
             candidate.with_context(|| {
                 format!(
-                    "forced codec {} cannot satisfy max_abs_error",
+                    "forced codec {} cannot satisfy the error tolerance",
                     codec_name(codec)
                 )
             })
@@ -315,10 +343,16 @@ fn select_candidate<T: Scalar>(
     }
 }
 
-fn required_error(policy: ResolvedComponentCodec) -> Result<f64> {
-    policy
-        .max_abs_error
-        .context("lossy codec selection requires max_abs_error")
+fn required_error(policy: ResolvedComponentCodec) -> Result<ErrorMetric> {
+    let tolerance = policy
+        .error_tolerance
+        .context("lossy codec selection requires an error tolerance")?;
+    Ok(ErrorMetric {
+        absolute: tolerance.absolute,
+        relative_fraction: tolerance.relative_percent / 100.0,
+        physical_offset: policy.physical_offset,
+        physical_scale: policy.physical_scale,
+    })
 }
 
 fn codec_id(codec: CompactChunkCodec) -> u32 {
@@ -356,7 +390,7 @@ pub(super) fn codec_name(codec: CompactChunkCodec) -> &'static str {
 fn dense_f32_candidate<T: Scalar>(
     values: &[T],
     mask: &[u64; MASK_WORDS],
-    limit: f64,
+    metric: ErrorMetric,
 ) -> Option<Candidate> {
     if T::TYPE == TYPE_F32 {
         return None;
@@ -371,10 +405,14 @@ fn dense_f32_candidate<T: Scalar>(
             if !reconstructed.is_finite() {
                 return None;
             }
-            error = error.max((value.to_domain() - reconstructed).abs());
+            let original = value.to_domain();
+            if !metric.accepts(original, reconstructed) {
+                return None;
+            }
+            error = error.max((original - reconstructed).abs());
         }
     }
-    (error <= limit).then_some(Candidate {
+    Some(Candidate {
         codec: CompactChunkCodec::DenseF32,
         max_abs_error: error,
         metadata: Vec::new(),
@@ -409,14 +447,14 @@ fn dense_native_candidate<T: Scalar>(values: &[T]) -> Candidate {
 fn approximate_uniform<T: Scalar>(
     values: &[T],
     mask: &[u64; MASK_WORDS],
-    limit: f64,
+    metric: ErrorMetric,
 ) -> Option<Candidate> {
     let (min, max) = present_range(values, mask)?;
     let center = min + (max - min) * 0.5;
     let decoded = T::from_domain(center);
     let actual = decoded.to_domain();
-    let error = present_max_error(values, mask, |_| actual);
-    (error <= limit).then(|| Candidate {
+    let error = present_max_error(values, mask, metric, |_| actual)?;
+    Some(Candidate {
         codec: CompactChunkCodec::UniformF64,
         max_abs_error: error,
         metadata: encode_uniform(decoded),
@@ -427,7 +465,7 @@ fn approximate_uniform<T: Scalar>(
 fn quantized_candidate<T: Scalar>(
     values: &[T],
     mask: &[u64; MASK_WORDS],
-    limit: f64,
+    metric: ErrorMetric,
     affine: Option<[f64; 4]>,
     bit_widths: &[u8],
 ) -> Option<Candidate> {
@@ -475,10 +513,15 @@ fn quantized_candidate<T: Scalar>(
                 let reconstructed =
                     affine.map_or(0.0, |c| predict(c, index)) + min + code as f64 * step;
                 let actual = T::from_domain(reconstructed).to_domain();
-                error = error.max((value.to_domain() - actual).abs());
+                let original = value.to_domain();
+                if !metric.accepts(original, actual) {
+                    error = f64::INFINITY;
+                } else {
+                    error = error.max((original - actual).abs());
+                }
             }
         }
-        if error <= limit {
+        if error.is_finite() {
             let mut metadata = Vec::with_capacity(if affine.is_some() { 48 } else { 16 });
             if let Some(coefficients) = affine {
                 append_f64s(&mut metadata, &coefficients);
@@ -506,13 +549,13 @@ fn quantized_candidate<T: Scalar>(
 fn affine_candidate<T: Scalar>(
     values: &[T],
     mask: &[u64; MASK_WORDS],
-    limit: f64,
+    metric: ErrorMetric,
     coefficients: [f64; 4],
 ) -> Option<Candidate> {
-    let error = present_max_error(values, mask, |index| {
+    let error = present_max_error(values, mask, metric, |index| {
         T::from_domain(predict(coefficients, index)).to_domain()
-    });
-    (error <= limit).then(|| {
+    })?;
+    Some({
         let mut metadata = Vec::with_capacity(32);
         append_f64s(&mut metadata, &coefficients);
         Candidate {
@@ -746,15 +789,22 @@ fn present_range<T: Scalar>(values: &[T], mask: &[u64; MASK_WORDS]) -> Option<(f
 fn present_max_error<T: Scalar>(
     values: &[T],
     mask: &[u64; MASK_WORDS],
+    metric: ErrorMetric,
     mut prediction: impl FnMut(usize) -> f64,
-) -> f64 {
-    values
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| present(mask, *index))
-        .fold(0.0_f64, |error, (index, value)| {
-            error.max((value.to_domain() - prediction(index)).abs())
-        })
+) -> Option<f64> {
+    let mut error = 0.0_f64;
+    for (index, &value) in values.iter().enumerate() {
+        if !present(mask, index) {
+            continue;
+        }
+        let original = value.to_domain();
+        let reconstructed = prediction(index);
+        if !metric.accepts(original, reconstructed) {
+            return None;
+        }
+        error = error.max((original - reconstructed).abs());
+    }
+    Some(error)
 }
 
 fn coordinates(index: usize) -> [f64; 3] {
@@ -832,14 +882,19 @@ fn unpack_payload(words: &[u64], length: u64) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compact::CompactErrorTolerance;
     use glam::UVec3;
 
     fn auto_policy(max_abs_error: f64) -> ResolvedComponentCodec {
         ResolvedComponentCodec {
             component_id: 0,
             selection: CompactChunkCodecSelection::AutoSmallest,
-            requested_tolerance: None,
-            max_abs_error: Some(max_abs_error),
+            error_tolerance: Some(CompactErrorTolerance {
+                absolute: max_abs_error,
+                relative_percent: 0.0,
+            }),
+            physical_offset: 0.0,
+            physical_scale: 1.0,
         }
     }
 
@@ -850,8 +905,12 @@ mod tests {
         ResolvedComponentCodec {
             component_id: 0,
             selection: CompactChunkCodecSelection::Forced(codec),
-            requested_tolerance: None,
-            max_abs_error,
+            error_tolerance: max_abs_error.map(|absolute| CompactErrorTolerance {
+                absolute,
+                relative_percent: 0.0,
+            }),
+            physical_offset: 0.0,
+            physical_scale: 1.0,
         }
     }
 
@@ -900,6 +959,55 @@ mod tests {
                 .unwrap();
             assert!((expected - actual).abs() <= 0.002);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn relative_error_is_pointwise_and_uses_physical_unorm_values() {
+        let metric = ErrorMetric {
+            absolute: 0.0,
+            relative_fraction: 0.0001,
+            physical_offset: 1.0e17,
+            physical_scale: 2.0e20 - 1.0e17,
+        };
+
+        // At normalized zero the physical value is 1e17, so 0.01% permits
+        // about 1e13 rather than a percentage of the entire normalization span.
+        let small_domain_delta = 0.9e13 / metric.physical_scale;
+        let large_domain_delta = 1.0e16 / metric.physical_scale;
+        assert!(metric.accepts(0.0, small_domain_delta));
+        assert!(!metric.accepts(0.0, large_domain_delta));
+
+        // The same absolute displacement is accepted for a value near 2e20.
+        assert!(metric.accepts(1.0, 1.0 - large_domain_delta));
+    }
+
+    #[test]
+    fn unorm_codec_rejects_global_range_sized_error_at_small_values() -> Result<()> {
+        let bounds = UVec3::splat(CHUNK_SIZE);
+        let mut grid = SparseGrid3::new(bounds);
+        let physical_scale = 2.0e20 - 1.0e17;
+        let high_code = u32::from_domain(1.0e16 / physical_scale);
+        let values = (0..CHUNK_VOLUME)
+            .map(|index| if index % 2 == 0 { 0 } else { high_code })
+            .collect::<Vec<_>>();
+        grid.write_aabb_values(grid.bounds_aabb(), &values)
+            .map_err(|error| anyhow::anyhow!("writing test grid: {error:?}"))?;
+
+        let result = encode_unorm32(
+            &grid,
+            ResolvedComponentCodec {
+                component_id: 0,
+                selection: CompactChunkCodecSelection::Forced(CompactChunkCodec::UniformF64),
+                error_tolerance: Some(CompactErrorTolerance {
+                    absolute: 0.0,
+                    relative_percent: 0.01,
+                }),
+                physical_offset: 1.0e17,
+                physical_scale,
+            },
+        );
+        assert!(result.is_err());
         Ok(())
     }
 

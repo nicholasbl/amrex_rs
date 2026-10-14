@@ -121,23 +121,29 @@ struct VariableConfig {
 #[serde(deny_unknown_fields)]
 struct ConfigErrorTolerance {
     absolute: Option<f64>,
-    range_percent: Option<f64>,
+    relative_percent: Option<f64>,
 }
 
 impl ConfigErrorTolerance {
     fn resolve(self) -> Result<CompactErrorTolerance> {
-        match (self.absolute, self.range_percent) {
-            (Some(value), None) => Ok(CompactErrorTolerance::Absolute(value)),
-            (None, Some(percent)) => {
-                ensure!(
-                    percent.is_finite() && (0.0..=100.0).contains(&percent),
-                    "range_percent must be finite and between 0 and 100"
-                );
-                Ok(CompactErrorTolerance::RangeFraction(percent / 100.0))
-            }
-            (None, None) => bail!("error must specify absolute or range_percent"),
-            (Some(_), Some(_)) => bail!("error cannot specify both absolute and range_percent"),
-        }
+        ensure!(
+            self.absolute.is_some() || self.relative_percent.is_some(),
+            "error must specify absolute, relative_percent, or both"
+        );
+        let absolute = self.absolute.unwrap_or(0.0);
+        let relative_percent = self.relative_percent.unwrap_or(0.0);
+        ensure!(
+            absolute.is_finite() && absolute >= 0.0,
+            "absolute error must be finite and non-negative"
+        );
+        ensure!(
+            relative_percent.is_finite() && (0.0..=100.0).contains(&relative_percent),
+            "relative_percent must be finite and between 0 and 100"
+        );
+        Ok(CompactErrorTolerance {
+            absolute,
+            relative_percent,
+        })
     }
 }
 
@@ -280,7 +286,7 @@ mod tests {
                 input = "dense.compact"
                 output = "lossy.compact"
                 codec = "auto:smallest"
-                error = { range_percent = 0.01 }
+                error = { relative_percent = 0.01 }
 
                 [[variables]]
                 name = "velocity_x"
@@ -291,11 +297,17 @@ mod tests {
         assert_eq!(config.variables.len(), 1);
         assert_eq!(
             config.error.unwrap().resolve()?,
-            CompactErrorTolerance::RangeFraction(0.0001)
+            CompactErrorTolerance {
+                absolute: 0.0,
+                relative_percent: 0.01,
+            }
         );
         assert_eq!(
             config.variables[0].error.unwrap().resolve()?,
-            CompactErrorTolerance::Absolute(1.0)
+            CompactErrorTolerance {
+                absolute: 1.0,
+                relative_percent: 0.0,
+            }
         );
         Ok(())
     }

@@ -1,8 +1,6 @@
 use std::{fs::File, path::PathBuf};
 
-use amrex_rs::{
-    CompactComponentStats, CompactErrorTolerance, CompactScalarType, read_compact, view_compact,
-};
+use amrex_rs::{CompactComponentStats, CompactScalarType, read_compact, view_compact};
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 
@@ -142,19 +140,32 @@ fn main() -> Result<()> {
         );
     }
 
+    let scalar_types = view.component_scalar_types().collect::<Vec<_>>();
     let codec_stats = view.chunk_codec_stats()?;
     if !codec_stats.is_empty() {
         println!("chunk codecs:");
         for stats in codec_stats {
             let name = stats.codec_name().unwrap_or("unknown");
+            let scalar_type = scalar_types
+                .iter()
+                .find_map(|&(component_id, scalar_type)| {
+                    (component_id == stats.component_id).then_some(scalar_type)
+                })
+                .context("codec statistics reference an unknown component")?;
+            let physical_error = match scalar_type {
+                CompactScalarType::F32 | CompactScalarType::F64 => stats.max_abs_error,
+                CompactScalarType::UNorm32 { min, max } => stats.max_abs_error * (max - min),
+            };
+            let normalized = matches!(scalar_type, CompactScalarType::UNorm32 { .. })
+                .then(|| format!(", normalized-error={:.7e}", stats.max_abs_error))
+                .unwrap_or_default();
             println!(
-                "  component {:>3}: {name} id={} version={} chunks={} codec-bytes={} max-error={:.7e}",
+                "  component {:>3}: {name} id={} version={} chunks={} codec-bytes={} max-abs-error={physical_error:.7e}{normalized}",
                 stats.component_id,
                 stats.codec_id,
                 stats.codec_version,
                 stats.chunk_count,
                 format_bytes(u128::from(stats.stored_bytes)),
-                stats.max_abs_error,
             );
         }
     }
@@ -166,15 +177,10 @@ fn main() -> Result<()> {
     if !error_tolerances.is_empty() {
         println!("error tolerances:");
         for info in error_tolerances {
-            let requested = match info.requested.expect("filtered above") {
-                CompactErrorTolerance::Absolute(value) => format!("absolute={value:.7e}"),
-                CompactErrorTolerance::RangeFraction(fraction) => {
-                    format!("range-percent={:.7}%", fraction * 100.0)
-                }
-            };
+            let requested = info.requested.expect("filtered above");
             println!(
-                "  component {:>3}: {requested}, resolved-max-abs={:.7e}",
-                info.component_id, info.resolved_max_abs_error
+                "  component {:>3}: absolute={:.7e}, relative-percent={:.7}%",
+                info.component_id, requested.absolute, requested.relative_percent
             );
         }
     }

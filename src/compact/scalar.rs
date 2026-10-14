@@ -53,13 +53,16 @@ pub enum CompactChunkCodecSelection {
 }
 
 /// Maximum pointwise error accepted from a lossy chunk codec.
+///
+/// For every physical source value `x` and reconstructed value `x_hat`, the
+/// codec must satisfy
+/// `abs(x_hat - x) <= absolute + relative_percent / 100 * abs(x)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CompactErrorTolerance {
-    /// Maximum absolute error in the reconstructed scalar domain.
-    Absolute(f64),
-    /// Maximum absolute error as a fraction of the component's global observed
-    /// range in the reconstructed scalar domain.
-    RangeFraction(f64),
+pub struct CompactErrorTolerance {
+    /// Absolute error floor in the quantity's original physical units.
+    pub absolute: f64,
+    /// Error permitted relative to each source value, expressed as a percentage.
+    pub relative_percent: f64,
 }
 
 /// Per-component chunk-codec policy.

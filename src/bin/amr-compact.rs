@@ -165,23 +165,29 @@ struct VariableConfig {
 #[serde(deny_unknown_fields)]
 struct ConfigErrorTolerance {
     absolute: Option<f64>,
-    range_percent: Option<f64>,
+    relative_percent: Option<f64>,
 }
 
 impl ConfigErrorTolerance {
     fn resolve(self) -> Result<CompactErrorTolerance> {
-        match (self.absolute, self.range_percent) {
-            (Some(value), None) => Ok(CompactErrorTolerance::Absolute(value)),
-            (None, Some(percent)) => {
-                ensure!(
-                    percent.is_finite() && (0.0..=100.0).contains(&percent),
-                    "range_percent must be finite and between 0 and 100"
-                );
-                Ok(CompactErrorTolerance::RangeFraction(percent / 100.0))
-            }
-            (None, None) => bail!("error must specify absolute or range_percent"),
-            (Some(_), Some(_)) => bail!("error cannot specify both absolute and range_percent"),
-        }
+        ensure!(
+            self.absolute.is_some() || self.relative_percent.is_some(),
+            "error must specify absolute, relative_percent, or both"
+        );
+        let absolute = self.absolute.unwrap_or(0.0);
+        let relative_percent = self.relative_percent.unwrap_or(0.0);
+        ensure!(
+            absolute.is_finite() && absolute >= 0.0,
+            "absolute error must be finite and non-negative"
+        );
+        ensure!(
+            relative_percent.is_finite() && (0.0..=100.0).contains(&relative_percent),
+            "relative_percent must be finite and between 0 and 100"
+        );
+        Ok(CompactErrorTolerance {
+            absolute,
+            relative_percent,
+        })
     }
 }
 
@@ -311,7 +317,7 @@ mod tests {
                 scalar_type = "unorm32"
                 codec = "auto:smallest"
                 normalize = [1.0e20, 1.000000001e20]
-                error = { range_percent = 0.01 }
+                error = { absolute = 1.0e10, relative_percent = 0.01 }
 
                 [[variables]]
                 name = "temperature"
@@ -335,7 +341,10 @@ mod tests {
         );
         ensure!(
             config.variables[0].error.unwrap().resolve()?
-                == CompactErrorTolerance::RangeFraction(0.0001)
+                == CompactErrorTolerance {
+                    absolute: 1.0e10,
+                    relative_percent: 0.01,
+                }
         );
         ensure!(
             parse_codec(config.variables[0].codec.as_deref().unwrap())?
@@ -399,18 +408,33 @@ mod tests {
     }
 
     #[test]
-    fn parses_absolute_and_range_percent_tolerances() -> Result<()> {
+    fn parses_absolute_and_relative_percent_tolerances() -> Result<()> {
         let absolute: ConfigErrorTolerance = toml::from_str("absolute = 2.5e12")?;
-        assert_eq!(absolute.resolve()?, CompactErrorTolerance::Absolute(2.5e12));
-
-        let relative: ConfigErrorTolerance = toml::from_str("range_percent = 0.01")?;
         assert_eq!(
-            relative.resolve()?,
-            CompactErrorTolerance::RangeFraction(0.0001)
+            absolute.resolve()?,
+            CompactErrorTolerance {
+                absolute: 2.5e12,
+                relative_percent: 0.0,
+            }
         );
 
-        let both: ConfigErrorTolerance = toml::from_str("absolute = 1.0\nrange_percent = 1.0")?;
-        assert!(both.resolve().is_err());
+        let relative: ConfigErrorTolerance = toml::from_str("relative_percent = 0.01")?;
+        assert_eq!(
+            relative.resolve()?,
+            CompactErrorTolerance {
+                absolute: 0.0,
+                relative_percent: 0.01,
+            }
+        );
+
+        let both: ConfigErrorTolerance = toml::from_str("absolute = 1.0\nrelative_percent = 1.0")?;
+        assert_eq!(
+            both.resolve()?,
+            CompactErrorTolerance {
+                absolute: 1.0,
+                relative_percent: 1.0,
+            }
+        );
         Ok(())
     }
 }

@@ -6,7 +6,7 @@ use crate::utility::{SparseGrid3, SparseGridChunkView};
 use crate::{BoundingBox, CoordinateSystem, Header, IndexDomain, Variable};
 
 pub(super) const FORMAT_MAGIC: u32 = u32::from_le_bytes(*b"AMRC");
-pub(super) const FORMAT_VERSION: u32 = 6;
+pub(super) const FORMAT_VERSION: u32 = 7;
 pub(super) const PREFIX_LENGTH: u64 = 8;
 pub(super) const FOOTER_LENGTH: u64 = 8;
 
@@ -24,10 +24,10 @@ pub(super) struct ArchiveStoredComponent {
     pub(super) scalar_type: u8,
     pub(super) min: f64,
     pub(super) max: f64,
-    /// 0 = none, 1 = absolute, 2 = fraction of the global observed range.
+    /// 0 = none, 1 = mixed absolute/pointwise-relative tolerance.
     pub(super) error_tolerance_kind: u8,
-    pub(super) error_tolerance_value: f64,
-    pub(super) resolved_max_abs_error: f64,
+    pub(super) error_absolute: f64,
+    pub(super) error_relative_percent: f64,
 }
 
 #[derive(Archive, Deserialize, Serialize)]
@@ -153,33 +153,32 @@ pub(super) fn scalar_type_fields(scalar_type: CompactScalarType) -> (u8, f64, f6
     }
 }
 
-pub(super) fn error_tolerance_fields(tolerance: Option<CompactErrorTolerance>) -> (u8, f64) {
+pub(super) fn error_tolerance_fields(tolerance: Option<CompactErrorTolerance>) -> (u8, f64, f64) {
     match tolerance {
-        None => (0, 0.0),
-        Some(CompactErrorTolerance::Absolute(value)) => (1, value),
-        Some(CompactErrorTolerance::RangeFraction(value)) => (2, value),
+        None => (0, 0.0, 0.0),
+        Some(tolerance) => (1, tolerance.absolute, tolerance.relative_percent),
     }
 }
 
 pub(super) fn archived_error_tolerance(
     kind: u8,
-    value: f64,
+    absolute: f64,
+    relative_percent: f64,
 ) -> Result<Option<CompactErrorTolerance>> {
     let tolerance = match kind {
         0 => {
-            anyhow::ensure!(value == 0.0, "missing error tolerance has a nonzero value");
+            anyhow::ensure!(
+                absolute == 0.0 && relative_percent == 0.0,
+                "missing error tolerance has nonzero parameters"
+            );
             None
         }
-        1 => Some(CompactErrorTolerance::Absolute(value)),
-        2 => Some(CompactErrorTolerance::RangeFraction(value)),
+        1 => Some(CompactErrorTolerance {
+            absolute,
+            relative_percent,
+        }),
         _ => anyhow::bail!("unsupported compact error tolerance kind {kind}"),
     };
-    if tolerance.is_some() {
-        anyhow::ensure!(
-            value.is_finite() && value >= 0.0,
-            "invalid compact error tolerance"
-        );
-    }
     Ok(tolerance)
 }
 

@@ -45,8 +45,23 @@ pub struct CompactOptions {
 struct ResolvedComponentCodec {
     component_id: u32,
     selection: CompactChunkCodecSelection,
-    requested_tolerance: Option<CompactErrorTolerance>,
-    max_abs_error: Option<f64>,
+    error_tolerance: Option<CompactErrorTolerance>,
+    /// Convert the codec's reconstructed domain to original physical values.
+    physical_offset: f64,
+    physical_scale: f64,
+}
+
+impl ResolvedComponentCodec {
+    fn max_domain_error_for_range(self, min: f64, max: f64) -> f64 {
+        let Some(tolerance) = self.error_tolerance else {
+            return 0.0;
+        };
+        let min = self.physical_offset + self.physical_scale * min;
+        let max = self.physical_offset + self.physical_scale * max;
+        let magnitude = min.abs().max(max.abs());
+        let physical_error = tolerance.absolute + tolerance.relative_percent / 100.0 * magnitude;
+        (physical_error / self.physical_scale.abs()).min(f64::MAX)
+    }
 }
 
 /// Result from a compaction operation
@@ -261,8 +276,6 @@ pub struct CompactComponentErrorTolerance {
     pub component_id: usize,
     /// User-requested tolerance, or `None` for lossless storage.
     pub requested: Option<CompactErrorTolerance>,
-    /// Absolute pointwise bound resolved in the reconstructed scalar domain.
-    pub resolved_max_abs_error: f64,
 }
 
 impl CompactChunkCodecStats {
@@ -420,13 +433,13 @@ impl CompactArchiveView<'_> {
         self.archive.components.iter().map(|component| {
             let requested = archived_error_tolerance(
                 component.error_tolerance_kind,
-                component.error_tolerance_value.to_native(),
+                component.error_absolute.to_native(),
+                component.error_relative_percent.to_native(),
             )
             .expect("compact archive error tolerance was validated");
             CompactComponentErrorTolerance {
                 component_id: component.component_id.to_native() as usize,
                 requested,
-                resolved_max_abs_error: component.resolved_max_abs_error.to_native(),
             }
         })
     }
@@ -523,18 +536,10 @@ fn validate_archive_header(archive: &ArchivedCompactArchiveHeader, bytes: &[u8])
         )?;
         let tolerance = archived_error_tolerance(
             component.error_tolerance_kind,
-            component.error_tolerance_value.to_native(),
+            component.error_absolute.to_native(),
+            component.error_relative_percent.to_native(),
         )?;
         validate_error_tolerance(tolerance)?;
-        let resolved_max_abs_error = component.resolved_max_abs_error.to_native();
-        ensure!(
-            resolved_max_abs_error.is_finite() && resolved_max_abs_error >= 0.0,
-            "compact component has invalid resolved error bound"
-        );
-        ensure!(
-            tolerance.is_some() || resolved_max_abs_error == 0.0,
-            "lossless compact component has a nonzero resolved error bound"
-        );
         let component_id = component.component_id.to_native() as usize;
         ensure!(
             component_id < archive.header.variables.len(),
@@ -923,7 +928,7 @@ fn write_archive(
                         max: uvec3_to_array(range.aabb.max),
                         value_min: range.min,
                         value_max: range.max,
-                        max_abs_error: codec.max_abs_error.unwrap_or(0.0),
+                        max_abs_error: codec.max_domain_error_for_range(range.min, range.max),
                     })
                     .collect(),
             });
@@ -963,8 +968,8 @@ fn write_archive(
                 "resolved component codec order changed"
             );
             let (scalar_type, min, max) = scalar_type_fields(scalar_type);
-            let (error_tolerance_kind, error_tolerance_value) =
-                error_tolerance_fields(codec.requested_tolerance);
+            let (error_tolerance_kind, error_absolute, error_relative_percent) =
+                error_tolerance_fields(codec.error_tolerance);
             Ok(ArchiveStoredComponent {
                 component_id: u32::try_from(component_id)
                     .context("component id does not fit in u32")?,
@@ -972,8 +977,8 @@ fn write_archive(
                 min,
                 max,
                 error_tolerance_kind,
-                error_tolerance_value,
-                resolved_max_abs_error: codec.max_abs_error.unwrap_or(0.0),
+                error_absolute,
+                error_relative_percent,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1340,23 +1345,18 @@ fn validate_codec_policy(
 }
 
 fn validate_error_tolerance(tolerance: Option<CompactErrorTolerance>) -> Result<()> {
-    match tolerance {
-        None => Ok(()),
-        Some(CompactErrorTolerance::Absolute(value)) => {
-            ensure!(
-                value.is_finite() && value >= 0.0,
-                "absolute error tolerance must be finite and non-negative"
-            );
-            Ok(())
-        }
-        Some(CompactErrorTolerance::RangeFraction(value)) => {
-            ensure!(
-                value.is_finite() && (0.0..=1.0).contains(&value),
-                "range-relative error tolerance must be a finite fraction from 0 to 1"
-            );
-            Ok(())
-        }
+    if let Some(tolerance) = tolerance {
+        ensure!(
+            tolerance.absolute.is_finite() && tolerance.absolute >= 0.0,
+            "absolute error tolerance must be finite and non-negative"
+        );
+        ensure!(
+            tolerance.relative_percent.is_finite()
+                && (0.0..=100.0).contains(&tolerance.relative_percent),
+            "relative error tolerance must be a finite percentage from 0 to 100"
+        );
     }
+    Ok(())
 }
 
 fn resolve_codecs(
@@ -1366,36 +1366,19 @@ fn resolve_codecs(
     requests
         .iter()
         .map(|&request| {
-            let max_abs_error = match request.error_tolerance {
-                None => None,
-                Some(CompactErrorTolerance::Absolute(value)) => Some(value),
-                Some(CompactErrorTolerance::RangeFraction(fraction)) => {
-                    let component_id = request.component_id as usize;
-                    let stats = compact
-                        .component_stats(component_id)
-                        .with_context(|| format!("component {component_id} is not loaded"))?;
-                    let range = match (stats.min, stats.max) {
-                        (Some(min), Some(max)) => max - min,
-                        (None, None) => 0.0,
-                        _ => anyhow::bail!("component {component_id} has incomplete value bounds"),
-                    };
-                    ensure!(
-                        range.is_finite() && range >= 0.0,
-                        "component {component_id} global range is not finite"
-                    );
-                    let resolved = range * fraction;
-                    ensure!(
-                        resolved.is_finite(),
-                        "component {component_id} resolved error tolerance is not finite"
-                    );
-                    Some(resolved)
-                }
+            let scalar_type = compact
+                .component_scalar_type(request.component_id as usize)
+                .with_context(|| format!("component {} is not loaded", request.component_id))?;
+            let (physical_offset, physical_scale) = match scalar_type {
+                CompactScalarType::F32 | CompactScalarType::F64 => (0.0, 1.0),
+                CompactScalarType::UNorm32 { min, max } => (min, max - min),
             };
             Ok(ResolvedComponentCodec {
                 component_id: request.component_id,
                 selection: request.selection,
-                requested_tolerance: request.error_tolerance,
-                max_abs_error,
+                error_tolerance: request.error_tolerance,
+                physical_offset,
+                physical_scale,
             })
         })
         .collect()
@@ -1664,7 +1647,10 @@ mod tests {
                     codecs: vec![CompactComponentCodec {
                         component_id: 0,
                         selection: CompactChunkCodecSelection::AutoSmallest,
-                        error_tolerance: Some(CompactErrorTolerance::RangeFraction(0.5)),
+                        error_tolerance: Some(CompactErrorTolerance {
+                            absolute: 0.5,
+                            relative_percent: 0.0,
+                        }),
                     }],
                 },
                 &mut transcoded,
@@ -1715,7 +1701,10 @@ mod tests {
                     codecs: vec![CompactComponentCodec {
                         component_id: 0,
                         selection: CompactChunkCodecSelection::AutoSmallest,
-                        error_tolerance: Some(CompactErrorTolerance::RangeFraction(0.5)),
+                        error_tolerance: Some(CompactErrorTolerance {
+                            absolute: 0.5,
+                            relative_percent: 0.0,
+                        }),
                     }],
                     ..CompactOptions::default()
                 },
@@ -1734,9 +1723,12 @@ mod tests {
             let tolerances = view.component_error_tolerances().collect::<Vec<_>>();
             ensure!(tolerances.len() == 1, "unexpected tolerance count");
             ensure!(
-                tolerances[0].requested == Some(CompactErrorTolerance::RangeFraction(0.5))
-                    && tolerances[0].resolved_max_abs_error == 0.5,
-                "range-relative tolerance metadata changed"
+                tolerances[0].requested
+                    == Some(CompactErrorTolerance {
+                        absolute: 0.5,
+                        relative_percent: 0.0,
+                    }),
+                "mixed tolerance metadata changed"
             );
 
             let compact = read_compact(&bytes)?;

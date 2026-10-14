@@ -254,7 +254,7 @@ name = "density"
 scalar_type = "unorm32"
 codec = "auto:smallest"
 normalize = [1.0e20, 1.000000001e20]
-error = { range_percent = 0.01 }
+error = { absolute = 1.0e10, relative_percent = 0.01 }
 
 [[variables]]
 name = "temperature"
@@ -274,12 +274,13 @@ Structurally uniform sparse chunks always retain the exact `uniform:f64`
 representation.
 
 Lossy policies require an `error` table; exact native dense codecs and
-`auto:lossless` reject it. `absolute` is measured after decoding in the
-reconstructed scalar domain. `range_percent` is a percentage of the quantity's
-global observed range in that same domain and is resolved once for all chunks.
-For example, `range_percent = 0.01` means 0.01%, not 1%. A constant quantity
-resolves to zero error. The reconstructed domain for `unorm32` is `[0, 1]`.
-Omitting `codec` uses `auto:lossless`.
+`auto:lossless` reject it. `absolute` is expressed in the quantity's original
+physical units, including for `unorm32`. `relative_percent` is evaluated against
+each individual source value. A reconstructed value must satisfy
+`abs(decoded - source) <= absolute + relative_percent / 100 * abs(source)`.
+Either field may be omitted and is then zero, but at least one must be present.
+For example, `relative_percent = 0.01` means 0.01%, not 1%. Omitting `codec`
+uses `auto:lossless`.
 
 Chunk codecs have independent numeric ids and versions in the archive. Their
 metadata and payloads are length-delimited, allowing future codecs to be added
@@ -324,7 +325,7 @@ Lossy policies can be applied globally with per-variable overrides:
 input = "dense-reference.compact"
 output = "test-0.01-percent.compact"
 codec = "auto:smallest"
-error = { range_percent = 0.01 }
+error = { absolute = 1.0e10, relative_percent = 0.01 }
 
 [[variables]]
 name = "velocity_x"
@@ -351,5 +352,5 @@ before MC33 visits individual cubes. Scalar calculations remain in `f64`; final
 mesh positions and UVs are stored as `f32` for graphics use.
 
 The compact archive format is intended for use by this crate and may change before a stable 1.0 release.
-The current offset-based format is version 6. Earlier archives must be
+The current offset-based format is version 7. Earlier archives must be
 regenerated with the current `amr-compact`.
