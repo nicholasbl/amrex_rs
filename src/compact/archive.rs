@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use rkyv::{Archive, Deserialize, Serialize};
 
-use super::CompactScalarType;
+use super::{CompactErrorTolerance, CompactScalarType};
 use crate::utility::{SparseGrid3, SparseGridChunkView};
 use crate::{BoundingBox, CoordinateSystem, Header, IndexDomain, Variable};
 
 pub(super) const FORMAT_MAGIC: u32 = u32::from_le_bytes(*b"AMRC");
-pub(super) const FORMAT_VERSION: u32 = 5;
+pub(super) const FORMAT_VERSION: u32 = 6;
 pub(super) const PREFIX_LENGTH: u64 = 8;
 pub(super) const FOOTER_LENGTH: u64 = 8;
 
@@ -24,6 +24,10 @@ pub(super) struct ArchiveStoredComponent {
     pub(super) scalar_type: u8,
     pub(super) min: f64,
     pub(super) max: f64,
+    /// 0 = none, 1 = absolute, 2 = fraction of the global observed range.
+    pub(super) error_tolerance_kind: u8,
+    pub(super) error_tolerance_value: f64,
+    pub(super) resolved_max_abs_error: f64,
 }
 
 #[derive(Archive, Deserialize, Serialize)]
@@ -147,6 +151,36 @@ pub(super) fn scalar_type_fields(scalar_type: CompactScalarType) -> (u8, f64, f6
         CompactScalarType::F64 => (1, 0.0, 0.0),
         CompactScalarType::UNorm32 { min, max } => (2, min, max),
     }
+}
+
+pub(super) fn error_tolerance_fields(tolerance: Option<CompactErrorTolerance>) -> (u8, f64) {
+    match tolerance {
+        None => (0, 0.0),
+        Some(CompactErrorTolerance::Absolute(value)) => (1, value),
+        Some(CompactErrorTolerance::RangeFraction(value)) => (2, value),
+    }
+}
+
+pub(super) fn archived_error_tolerance(
+    kind: u8,
+    value: f64,
+) -> Result<Option<CompactErrorTolerance>> {
+    let tolerance = match kind {
+        0 => {
+            anyhow::ensure!(value == 0.0, "missing error tolerance has a nonzero value");
+            None
+        }
+        1 => Some(CompactErrorTolerance::Absolute(value)),
+        2 => Some(CompactErrorTolerance::RangeFraction(value)),
+        _ => anyhow::bail!("unsupported compact error tolerance kind {kind}"),
+    };
+    if tolerance.is_some() {
+        anyhow::ensure!(
+            value.is_finite() && value >= 0.0,
+            "invalid compact error tolerance"
+        );
+    }
+    Ok(tolerance)
 }
 
 pub(super) fn archived_scalar_type(tag: u8, min: f64, max: f64) -> Result<CompactScalarType> {

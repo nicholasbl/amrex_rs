@@ -1,6 +1,8 @@
 use std::{env, fs::File, path::PathBuf};
 
-use amrex_rs::{CompactComponentStats, CompactScalarType, read_compact, view_compact};
+use amrex_rs::{
+    CompactComponentStats, CompactErrorTolerance, CompactScalarType, read_compact, view_compact,
+};
 use anyhow::{Context, Result, ensure};
 
 fn usage(program: &str) -> String {
@@ -168,6 +170,26 @@ fn main() -> Result<()> {
                 stats.chunk_count,
                 format_bytes(u128::from(stats.stored_bytes)),
                 stats.max_abs_error,
+            );
+        }
+    }
+
+    let error_tolerances = view
+        .component_error_tolerances()
+        .filter(|info| info.requested.is_some())
+        .collect::<Vec<_>>();
+    if !error_tolerances.is_empty() {
+        println!("error tolerances:");
+        for info in error_tolerances {
+            let requested = match info.requested.expect("filtered above") {
+                CompactErrorTolerance::Absolute(value) => format!("absolute={value:.7e}"),
+                CompactErrorTolerance::RangeFraction(fraction) => {
+                    format!("range-percent={:.7}%", fraction * 100.0)
+                }
+            };
+            println!(
+                "  component {:>3}: {requested}, resolved-max-abs={:.7e}",
+                info.component_id, info.resolved_max_abs_error
             );
         }
     }

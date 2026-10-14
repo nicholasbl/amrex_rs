@@ -9,7 +9,8 @@ pub(crate) mod scalar;
 
 pub use scalar::{
     CompactChunkCodec, CompactChunkCodecSelection, CompactComponentCodec,
-    CompactComponentScalarType, CompactScalarType, NonFinitePolicy, NonFiniteReplacement,
+    CompactComponentScalarType, CompactErrorTolerance, CompactScalarType, NonFinitePolicy,
+    NonFiniteReplacement,
 };
 
 use std::io::Write;
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::sparse_amr::{SparseAmr, SparseAmrLevel};
 use crate::utility::{Aabb3u, SparseGrid3};
-use crate::{CoordinateSystem, Header, PlotFile, Variable};
+use crate::{CoordinateSystem, PlotFile, Variable};
 
 use anyhow::{Context, Result, ensure};
 use glam::{DVec3, IVec3, UVec3};
@@ -40,6 +41,14 @@ pub struct CompactOptions {
     pub non_finite_policy: NonFinitePolicy,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResolvedComponentCodec {
+    component_id: u32,
+    selection: CompactChunkCodecSelection,
+    requested_tolerance: Option<CompactErrorTolerance>,
+    max_abs_error: Option<f64>,
+}
+
 /// Result from a compaction operation
 #[derive(Debug, Default)]
 pub struct WriteCompactResult {
@@ -51,6 +60,25 @@ pub struct WriteCompactResult {
     pub serialization_time: Duration,
     /// Aggregate non-finite or unrepresentable replacements, omitting zero counts.
     pub non_finite_replacements: Vec<NonFiniteReplacement>,
+}
+
+/// Options for rewriting an existing compact archive with new chunk codecs.
+#[derive(Debug, Default)]
+pub struct TranscodeCompactOptions {
+    /// Per-component codec policies. Unlisted stored components use
+    /// `AutoLossless`. Reconstructed scalar types are preserved.
+    pub codecs: Vec<CompactComponentCodec>,
+}
+
+/// Timings from transcoding an existing compact archive.
+#[derive(Debug, Default)]
+pub struct TranscodeCompactResult {
+    /// Time spent validating and decoding the source archive.
+    pub decode_time: Duration,
+    /// Time spent choosing codecs and building archive metadata.
+    pub archive_time: Duration,
+    /// Time spent serializing and writing archive bytes.
+    pub serialization_time: Duration,
 }
 
 /// Write selected plotfile components as a compact binary archive.
@@ -66,7 +94,7 @@ pub fn write_compact(
 
     let component_ids = selected_component_ids(plot_file, &options)?;
     let scalar_types = selected_scalar_types(&component_ids, &options)?;
-    let codecs = selected_codecs(&component_ids, &scalar_types, &options)?;
+    let codec_requests = selected_codecs(&component_ids, &scalar_types, &options.codecs)?;
     let (compact, replacement_counts) = CompactPlot::load_with_scalar_types(
         plot_file,
         &component_ids,
@@ -75,8 +103,13 @@ pub fn write_compact(
     )?;
 
     let compact_time = now.elapsed();
-    let (archive_time, serialization_time) =
-        write_archive(plot_file.header(), compact, &codecs, dest)?;
+    let codecs = resolve_codecs(&compact, &codec_requests)?;
+    let (archive_time, serialization_time) = write_archive(
+        ArchiveHeader::from_header(plot_file.header()),
+        compact,
+        &codecs,
+        dest,
+    )?;
     let non_finite_replacements = component_ids
         .iter()
         .zip(replacement_counts)
@@ -93,6 +126,40 @@ pub fn write_compact(
         archive_time,
         serialization_time,
         non_finite_replacements,
+    })
+}
+
+/// Rewrite a compact archive using new per-component chunk-codec policies.
+///
+/// The source archive's reconstructed scalar types and AMR metadata are
+/// preserved. Transcoding a lossy source operates on its decoded values and
+/// cannot recover precision discarded by the source codec.
+pub fn transcode_compact(
+    bytes: &[u8],
+    options: TranscodeCompactOptions,
+    dest: &mut impl Write,
+) -> Result<TranscodeCompactResult> {
+    let start = Instant::now();
+    let view = view_compact(bytes).context("validating source compact archive")?;
+    let source_header = rkyv::deserialize::<CompactArchiveHeader, Error>(view.archive)
+        .context("deserializing source compact archive header")?
+        .header;
+    let mut compact = read_compact_impl(bytes, None).context("decoding source compact archive")?;
+    compact.rebuild_value_ranges();
+    let decode_time = start.elapsed();
+
+    let requests = selected_codecs(
+        &compact.component_ids,
+        &compact.scalar_types,
+        &options.codecs,
+    )?;
+    let codecs = resolve_codecs(&compact, &requests)?;
+    let (archive_time, serialization_time) = write_archive(source_header, compact, &codecs, dest)?;
+
+    Ok(TranscodeCompactResult {
+        decode_time,
+        archive_time,
+        serialization_time,
     })
 }
 
@@ -185,6 +252,17 @@ pub struct CompactChunkCodecStats {
     pub stored_bytes: u64,
     /// Largest verified pointwise error recorded for these chunks.
     pub max_abs_error: f64,
+}
+
+/// Error policy recorded for one stored component.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactComponentErrorTolerance {
+    /// Original plotfile component id.
+    pub component_id: usize,
+    /// User-requested tolerance, or `None` for lossless storage.
+    pub requested: Option<CompactErrorTolerance>,
+    /// Absolute pointwise bound resolved in the reconstructed scalar domain.
+    pub resolved_max_abs_error: f64,
 }
 
 impl CompactChunkCodecStats {
@@ -335,6 +413,24 @@ impl CompactArchiveView<'_> {
         })
     }
 
+    /// Error tolerances stored for each component.
+    pub fn component_error_tolerances(
+        &self,
+    ) -> impl ExactSizeIterator<Item = CompactComponentErrorTolerance> + '_ {
+        self.archive.components.iter().map(|component| {
+            let requested = archived_error_tolerance(
+                component.error_tolerance_kind,
+                component.error_tolerance_value.to_native(),
+            )
+            .expect("compact archive error tolerance was validated");
+            CompactComponentErrorTolerance {
+                component_id: component.component_id.to_native() as usize,
+                requested,
+                resolved_max_abs_error: component.resolved_max_abs_error.to_native(),
+            }
+        })
+    }
+
     /// Number of AMR levels stored in this archive.
     pub fn level_count(&self) -> usize {
         self.archive.levels.len()
@@ -425,6 +521,20 @@ fn validate_archive_header(archive: &ArchivedCompactArchiveHeader, bytes: &[u8])
             component.min.to_native(),
             component.max.to_native(),
         )?;
+        let tolerance = archived_error_tolerance(
+            component.error_tolerance_kind,
+            component.error_tolerance_value.to_native(),
+        )?;
+        validate_error_tolerance(tolerance)?;
+        let resolved_max_abs_error = component.resolved_max_abs_error.to_native();
+        ensure!(
+            resolved_max_abs_error.is_finite() && resolved_max_abs_error >= 0.0,
+            "compact component has invalid resolved error bound"
+        );
+        ensure!(
+            tolerance.is_some() || resolved_max_abs_error == 0.0,
+            "lossless compact component has a nonzero resolved error bound"
+        );
         let component_id = component.component_id.to_native() as usize;
         ensure!(
             component_id < archive.header.variables.len(),
@@ -720,12 +830,22 @@ impl CompactPlot {
             .iter()
             .position(|&loaded_id| loaded_id == component_id)
     }
+
+    fn rebuild_value_ranges(&mut self) {
+        for level in &mut self.levels {
+            level.value_ranges = level
+                .components
+                .iter()
+                .map(|component| build_chunk_value_ranges(component, &level.eligible_cubes))
+                .collect();
+        }
+    }
 }
 
 fn write_archive(
-    source_header: &Header,
+    source_header: ArchiveHeader,
     compact: CompactPlot,
-    codecs: &[CompactComponentCodec],
+    codecs: &[ResolvedComponentCodec],
     dest: &mut impl Write,
 ) -> Result<(Duration, Duration)> {
     let mut archive_time = Duration::ZERO;
@@ -836,20 +956,30 @@ fn write_archive(
     let components = component_ids
         .into_iter()
         .zip(scalar_types)
-        .map(|(component_id, scalar_type)| {
+        .zip(codecs)
+        .map(|((component_id, scalar_type), codec)| {
+            ensure!(
+                usize::try_from(codec.component_id).ok() == Some(component_id),
+                "resolved component codec order changed"
+            );
             let (scalar_type, min, max) = scalar_type_fields(scalar_type);
+            let (error_tolerance_kind, error_tolerance_value) =
+                error_tolerance_fields(codec.requested_tolerance);
             Ok(ArchiveStoredComponent {
                 component_id: u32::try_from(component_id)
                     .context("component id does not fit in u32")?,
                 scalar_type,
                 min,
                 max,
+                error_tolerance_kind,
+                error_tolerance_value,
+                resolved_max_abs_error: codec.max_abs_error.unwrap_or(0.0),
             })
         })
         .collect::<Result<Vec<_>>>()?;
     let archive = CompactArchiveHeader {
         chunk_bits: crate::utility::CHUNK_BITS,
-        header: ArchiveHeader::from_header(source_header),
+        header: source_header,
         components,
         levels: archive_levels,
     };
@@ -1138,7 +1268,7 @@ fn selected_scalar_types(
 fn selected_codecs(
     component_ids: &[usize],
     scalar_types: &[CompactScalarType],
-    options: &CompactOptions,
+    requested_codecs: &[CompactComponentCodec],
 ) -> Result<Vec<CompactComponentCodec>> {
     ensure!(
         component_ids.len() == scalar_types.len(),
@@ -1149,17 +1279,12 @@ fn selected_codecs(
         .map(|&component_id| CompactComponentCodec {
             component_id: component_id as u32,
             selection: CompactChunkCodecSelection::AutoLossless,
-            max_abs_error: None,
+            error_tolerance: None,
         })
         .collect::<Vec<_>>();
     let mut assigned = vec![false; component_ids.len()];
-    for &requested in &options.codecs {
-        if let Some(error) = requested.max_abs_error {
-            ensure!(
-                error.is_finite() && error >= 0.0,
-                "maximum absolute chunk error must be finite and non-negative"
-            );
-        }
+    for &requested in requested_codecs {
+        validate_error_tolerance(requested.error_tolerance)?;
         let component_id = usize::try_from(requested.component_id)
             .context("codec component id does not fit in usize")?;
         let slot = component_ids
@@ -1204,14 +1329,76 @@ fn validate_codec_policy(
         },
     };
     ensure!(
-        policy.max_abs_error.is_some() == requires_error,
+        policy.error_tolerance.is_some() == requires_error,
         if requires_error {
-            "lossy codec policy requires max_abs_error"
+            "lossy codec policy requires an error tolerance"
         } else {
-            "lossless codec policy does not accept max_abs_error"
+            "lossless codec policy does not accept an error tolerance"
         }
     );
     Ok(())
+}
+
+fn validate_error_tolerance(tolerance: Option<CompactErrorTolerance>) -> Result<()> {
+    match tolerance {
+        None => Ok(()),
+        Some(CompactErrorTolerance::Absolute(value)) => {
+            ensure!(
+                value.is_finite() && value >= 0.0,
+                "absolute error tolerance must be finite and non-negative"
+            );
+            Ok(())
+        }
+        Some(CompactErrorTolerance::RangeFraction(value)) => {
+            ensure!(
+                value.is_finite() && (0.0..=1.0).contains(&value),
+                "range-relative error tolerance must be a finite fraction from 0 to 1"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn resolve_codecs(
+    compact: &CompactPlot,
+    requests: &[CompactComponentCodec],
+) -> Result<Vec<ResolvedComponentCodec>> {
+    requests
+        .iter()
+        .map(|&request| {
+            let max_abs_error = match request.error_tolerance {
+                None => None,
+                Some(CompactErrorTolerance::Absolute(value)) => Some(value),
+                Some(CompactErrorTolerance::RangeFraction(fraction)) => {
+                    let component_id = request.component_id as usize;
+                    let stats = compact
+                        .component_stats(component_id)
+                        .with_context(|| format!("component {component_id} is not loaded"))?;
+                    let range = match (stats.min, stats.max) {
+                        (Some(min), Some(max)) => max - min,
+                        (None, None) => 0.0,
+                        _ => anyhow::bail!("component {component_id} has incomplete value bounds"),
+                    };
+                    ensure!(
+                        range.is_finite() && range >= 0.0,
+                        "component {component_id} global range is not finite"
+                    );
+                    let resolved = range * fraction;
+                    ensure!(
+                        resolved.is_finite(),
+                        "component {component_id} resolved error tolerance is not finite"
+                    );
+                    Some(resolved)
+                }
+            };
+            Ok(ResolvedComponentCodec {
+                component_id: request.component_id,
+                selection: request.selection,
+                requested_tolerance: request.error_tolerance,
+                max_abs_error,
+            })
+        })
+        .collect()
 }
 
 fn build_active_dual_cubes_for_scalar(
@@ -1446,6 +1633,65 @@ mod tests {
     }
 
     #[test]
+    fn transcode_preserves_scalar_type_and_reencodes_chunks() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "amrex_rs_compact_transcode_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        write_single_cube_plotfile_values(&root, [0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0])?;
+
+        let result = (|| -> Result<()> {
+            let plotfile = PlotFile::open(&root)?;
+            let mut source = Vec::new();
+            write_compact(
+                &plotfile,
+                CompactOptions {
+                    component_ids: vec![0],
+                    scalar_types: vec![CompactComponentScalarType {
+                        component_id: 0,
+                        scalar_type: CompactScalarType::F64,
+                    }],
+                    ..CompactOptions::default()
+                },
+                &mut source,
+            )?;
+
+            let mut transcoded = Vec::new();
+            transcode_compact(
+                &source,
+                TranscodeCompactOptions {
+                    codecs: vec![CompactComponentCodec {
+                        component_id: 0,
+                        selection: CompactChunkCodecSelection::AutoSmallest,
+                        error_tolerance: Some(CompactErrorTolerance::RangeFraction(0.5)),
+                    }],
+                },
+                &mut transcoded,
+            )?;
+
+            let view = view_compact(&transcoded)?;
+            ensure!(
+                view.component_scalar_types()
+                    .eq([(0, CompactScalarType::F64)]),
+                "transcode changed the reconstructed scalar type"
+            );
+            let codecs = view.chunk_codec_stats()?;
+            ensure!(
+                codecs.len() == 1 && codecs[0].codec_id == chunk_codec::CODEC_UNIFORM,
+                "transcode did not apply the requested codec policy"
+            );
+            let compact = read_compact(&transcoded)?;
+            let stats = compact.component_stats(0).context("missing component")?;
+            ensure!(stats.min == Some(0.5) && stats.max == Some(0.5));
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&root);
+        result
+    }
+
+    #[test]
     fn adaptive_archive_reports_codec_and_respects_error() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
             "amrex_rs_compact_adaptive_test_{}",
@@ -1469,7 +1715,7 @@ mod tests {
                     codecs: vec![CompactComponentCodec {
                         component_id: 0,
                         selection: CompactChunkCodecSelection::AutoSmallest,
-                        max_abs_error: Some(0.5),
+                        error_tolerance: Some(CompactErrorTolerance::RangeFraction(0.5)),
                     }],
                     ..CompactOptions::default()
                 },
@@ -1484,6 +1730,14 @@ mod tests {
                 "expected approximate uniform chunk"
             );
             ensure!(codecs[0].max_abs_error <= 0.5);
+
+            let tolerances = view.component_error_tolerances().collect::<Vec<_>>();
+            ensure!(tolerances.len() == 1, "unexpected tolerance count");
+            ensure!(
+                tolerances[0].requested == Some(CompactErrorTolerance::RangeFraction(0.5))
+                    && tolerances[0].resolved_max_abs_error == 0.5,
+                "range-relative tolerance metadata changed"
+            );
 
             let compact = read_compact(&bytes)?;
             let stats = compact.component_stats(0).context("missing component")?;

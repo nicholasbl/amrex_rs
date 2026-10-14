@@ -17,9 +17,11 @@ pub mod utility;
 pub use compact::read_compact_selected_unchecked;
 pub use compact::{
     CompactArchiveView, CompactChunkCodec, CompactChunkCodecSelection, CompactChunkCodecStats,
-    CompactComponentCodec, CompactComponentScalarType, CompactComponentStats, CompactOptions,
-    CompactPlot, CompactScalarType, NonFinitePolicy, NonFiniteReplacement, read_compact,
-    read_compact_selected, view_compact, view_compact_unchecked, write_compact,
+    CompactComponentCodec, CompactComponentErrorTolerance, CompactComponentScalarType,
+    CompactComponentStats, CompactErrorTolerance, CompactOptions, CompactPlot, CompactScalarType,
+    NonFinitePolicy, NonFiniteReplacement, TranscodeCompactOptions, TranscodeCompactResult,
+    read_compact, read_compact_selected, transcode_compact, view_compact, view_compact_unchecked,
+    write_compact,
 };
 pub use decimate::{
     DecimateErrorMode, DecimateOptions, DecimateParallelOptions, DecimatePipelineOptions,

@@ -253,29 +253,32 @@ name = "density"
 scalar_type = "unorm32"
 codec = "auto:smallest"
 normalize = [1.0e20, 1.000000001e20]
-max_abs_error = 1.0e-6
+error = { range_percent = 0.01 }
 
 [[variables]]
 name = "temperature"
 scalar_type = "f64"
 codec = "quantized:u16"
-max_abs_error = 1.0e-4
+error = { absolute = 1.0e-4 }
 ```
 
 `codec` controls the on-disk representation independently of `scalar_type`.
 Every codec name uses `family:value` syntax. Automatic policies are
 `auto:lossless` and `auto:smallest`. The latter selects the smallest supported
-codec that meets `max_abs_error`. Concrete codecs force every non-uniform chunk
+codec that meets the configured error tolerance. Concrete codecs force every non-uniform chunk
 to use that codec: `dense:f32`, `dense:f64`, `dense:u32`, `uniform:f64`,
 `quantized:u8`, `quantized:u16`, `quantized:u32`, `affine:f64`, and
 `affine-residual:u8`, `affine-residual:u16`, or `affine-residual:u32`.
 Structurally uniform sparse chunks always retain the exact `uniform:f64`
 representation.
 
-Lossy policies require `max_abs_error`; exact native dense codecs and
-`auto:lossless` reject it. The tolerance is measured after decoding in the
-reconstructed scalar domain, so it is in `[0, 1]` units for `unorm32`
-quantities. Omitting `codec` uses `auto:lossless`.
+Lossy policies require an `error` table; exact native dense codecs and
+`auto:lossless` reject it. `absolute` is measured after decoding in the
+reconstructed scalar domain. `range_percent` is a percentage of the quantity's
+global observed range in that same domain and is resolved once for all chunks.
+For example, `range_percent = 0.01` means 0.01%, not 1%. A constant quantity
+resolves to zero error. The reconstructed domain for `unorm32` is `[0, 1]`.
+Omitting `codec` uses `auto:lossless`.
 
 Chunk codecs have independent numeric ids and versions in the archive. Their
 metadata and payloads are length-delimited, allowing future codecs to be added
@@ -304,6 +307,40 @@ zero and prints aggregate warnings. Set `assume_finite = true` at the top level
 of a trusted config to skip those checks. Input and output may be supplied in
 the config or overridden on the command line.
 
+To compare codec choices without rereading the original plotfile, transcode an
+existing compact archive. With no configuration, every stored quantity is
+rewritten losslessly using the dense codec native to its reconstructed scalar
+type:
+
+```sh
+cargo run --release --bin compact_transcode -- \
+  source.compact dense-reference.compact
+```
+
+Lossy policies can be applied globally with per-variable overrides:
+
+```toml
+input = "dense-reference.compact"
+output = "test-0.01-percent.compact"
+codec = "auto:smallest"
+error = { range_percent = 0.01 }
+
+[[variables]]
+name = "velocity_x"
+codec = "quantized:u16"
+error = { absolute = 1.0 }
+```
+
+```sh
+cargo run --release --bin compact_transcode -- --config transcode.toml
+```
+
+Command-line input and output paths may follow the config path to override its
+paths. Transcoding preserves each quantity's reconstructed scalar type and all
+AMR metadata. It operates on decoded values, so transcoding a lossy archive
+cannot recover precision already discarded; use a lossless dense archive as
+the source when comparing codecs.
+
 ## Notes
 
 Isosurface extraction expects cell-centered data. Compact archives contain a
@@ -313,5 +350,5 @@ before MC33 visits individual cubes. Scalar calculations remain in `f64`; final
 mesh positions and UVs are stored as `f32` for graphics use.
 
 The compact archive format is intended for use by this crate and may change before a stable 1.0 release.
-The current offset-based format is version 5. Earlier archives must be
+The current offset-based format is version 6. Earlier archives must be
 regenerated with the current `pltcompact`.

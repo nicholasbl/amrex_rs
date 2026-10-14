@@ -7,8 +7,8 @@ use std::{
 
 use amrex_rs::{
     CompactChunkCodec, CompactChunkCodecSelection, CompactComponentCodec,
-    CompactComponentScalarType, CompactOptions, CompactScalarType, NonFinitePolicy, PlotFile,
-    write_compact,
+    CompactComponentScalarType, CompactErrorTolerance, CompactOptions, CompactScalarType,
+    NonFinitePolicy, PlotFile, write_compact,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -54,17 +54,20 @@ fn main() -> Result<()> {
             component_id,
             scalar_type,
         });
-        if requested.codec.is_some() || requested.max_abs_error.is_some() {
+        if requested.codec.is_some() || requested.error.is_some() {
             let selection = requested
                 .codec
                 .as_deref()
                 .map(parse_codec)
                 .transpose()?
-                .context("max_abs_error requires an explicit codec")?;
+                .context("an error tolerance requires an explicit codec")?;
             codecs.push(CompactComponentCodec {
                 component_id,
                 selection,
-                max_abs_error: requested.max_abs_error,
+                error_tolerance: requested
+                    .error
+                    .map(ConfigErrorTolerance::resolve)
+                    .transpose()?,
             });
         }
     }
@@ -137,7 +140,31 @@ struct VariableConfig {
     scalar_type: Option<ConfigScalarType>,
     codec: Option<String>,
     normalize: Option<[f64; 2]>,
-    max_abs_error: Option<f64>,
+    error: Option<ConfigErrorTolerance>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigErrorTolerance {
+    absolute: Option<f64>,
+    range_percent: Option<f64>,
+}
+
+impl ConfigErrorTolerance {
+    fn resolve(self) -> Result<CompactErrorTolerance> {
+        match (self.absolute, self.range_percent) {
+            (Some(value), None) => Ok(CompactErrorTolerance::Absolute(value)),
+            (None, Some(percent)) => {
+                ensure!(
+                    percent.is_finite() && (0.0..=100.0).contains(&percent),
+                    "range_percent must be finite and between 0 and 100"
+                );
+                Ok(CompactErrorTolerance::RangeFraction(percent / 100.0))
+            }
+            (None, None) => bail!("error must specify absolute or range_percent"),
+            (Some(_), Some(_)) => bail!("error cannot specify both absolute and range_percent"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -229,7 +256,7 @@ impl Args {
                     scalar_type: None,
                     codec: None,
                     normalize: None,
-                    max_abs_error: None,
+                    error: None,
                 })
                 .collect(),
             assume_finite: false,
@@ -254,7 +281,7 @@ mod tests {
                 scalar_type = "unorm32"
                 codec = "auto:smallest"
                 normalize = [1.0e20, 1.000000001e20]
-                max_abs_error = 1.0e-6
+                error = { range_percent = 0.01 }
 
                 [[variables]]
                 name = "temperature"
@@ -276,7 +303,10 @@ mod tests {
             config.variables[0].normalize == Some([1.0e20, 1.000000001e20]),
             "normalization bounds changed while parsing"
         );
-        ensure!(config.variables[0].max_abs_error == Some(1.0e-6));
+        ensure!(
+            config.variables[0].error.unwrap().resolve()?
+                == CompactErrorTolerance::RangeFraction(0.0001)
+        );
         ensure!(
             parse_codec(config.variables[0].codec.as_deref().unwrap())?
                 == CompactChunkCodecSelection::AutoSmallest
@@ -335,6 +365,22 @@ mod tests {
         }
         assert!(parse_codec("raw:f64").is_err());
         assert!(parse_codec("quantized:16").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_absolute_and_range_percent_tolerances() -> Result<()> {
+        let absolute: ConfigErrorTolerance = toml::from_str("absolute = 2.5e12")?;
+        assert_eq!(absolute.resolve()?, CompactErrorTolerance::Absolute(2.5e12));
+
+        let relative: ConfigErrorTolerance = toml::from_str("range_percent = 0.01")?;
+        assert_eq!(
+            relative.resolve()?,
+            CompactErrorTolerance::RangeFraction(0.0001)
+        );
+
+        let both: ConfigErrorTolerance = toml::from_str("absolute = 1.0\nrange_percent = 1.0")?;
+        assert!(both.resolve().is_err());
         Ok(())
     }
 }

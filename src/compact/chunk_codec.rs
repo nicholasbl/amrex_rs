@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 
 use super::archive::{ArchiveScalarChunk, ArchiveScalarGrid, array_to_uvec3, uvec3_to_array};
-use super::{CompactChunkCodec, CompactChunkCodecSelection, CompactComponentCodec};
+use super::{CompactChunkCodec, CompactChunkCodecSelection, ResolvedComponentCodec};
 use crate::utility::{CHUNK_BITS, CHUNK_VOLUME, MASK_WORDS, SparseGrid3, SparseGridChunkView};
 
 const CHUNK_SIZE: u32 = 1 << CHUNK_BITS;
@@ -113,28 +113,28 @@ impl Candidate {
 
 pub(super) fn encode_f32(
     grid: &SparseGrid3<f32>,
-    policy: CompactComponentCodec,
+    policy: ResolvedComponentCodec,
 ) -> Result<ArchiveScalarGrid> {
     encode_grid(grid, policy)
 }
 
 pub(super) fn encode_f64(
     grid: &SparseGrid3<f64>,
-    policy: CompactComponentCodec,
+    policy: ResolvedComponentCodec,
 ) -> Result<ArchiveScalarGrid> {
     encode_grid(grid, policy)
 }
 
 pub(super) fn encode_unorm32(
     grid: &SparseGrid3<u32>,
-    policy: CompactComponentCodec,
+    policy: ResolvedComponentCodec,
 ) -> Result<ArchiveScalarGrid> {
     encode_grid(grid, policy)
 }
 
 fn encode_grid<T: Scalar>(
     grid: &SparseGrid3<T>,
-    policy: CompactComponentCodec,
+    policy: ResolvedComponentCodec,
 ) -> Result<ArchiveScalarGrid> {
     if let Some(error) = policy.max_abs_error {
         ensure!(
@@ -183,7 +183,7 @@ fn encode_dense<T: Scalar>(
     key: glam::UVec3,
     values: &[T],
     mask: [u64; MASK_WORDS],
-    policy: CompactComponentCodec,
+    policy: ResolvedComponentCodec,
 ) -> Result<ArchiveScalarChunk> {
     ensure!(values.len() == CHUNK_VOLUME, "invalid dense chunk length");
     let best = select_candidate(values, &mask, policy)
@@ -206,7 +206,7 @@ fn encode_dense<T: Scalar>(
 fn select_candidate<T: Scalar>(
     values: &[T],
     mask: &[u64; MASK_WORDS],
-    policy: CompactComponentCodec,
+    policy: ResolvedComponentCodec,
 ) -> Result<Candidate> {
     match policy.selection {
         CompactChunkCodecSelection::AutoLossless => {
@@ -315,7 +315,7 @@ fn select_candidate<T: Scalar>(
     }
 }
 
-fn required_error(policy: CompactComponentCodec) -> Result<f64> {
+fn required_error(policy: ResolvedComponentCodec) -> Result<f64> {
     policy
         .max_abs_error
         .context("lossy codec selection requires max_abs_error")
@@ -834,10 +834,11 @@ mod tests {
     use super::*;
     use glam::UVec3;
 
-    fn auto_policy(max_abs_error: f64) -> CompactComponentCodec {
-        CompactComponentCodec {
+    fn auto_policy(max_abs_error: f64) -> ResolvedComponentCodec {
+        ResolvedComponentCodec {
             component_id: 0,
             selection: CompactChunkCodecSelection::AutoSmallest,
+            requested_tolerance: None,
             max_abs_error: Some(max_abs_error),
         }
     }
@@ -845,10 +846,11 @@ mod tests {
     fn forced_policy(
         codec: CompactChunkCodec,
         max_abs_error: Option<f64>,
-    ) -> CompactComponentCodec {
-        CompactComponentCodec {
+    ) -> ResolvedComponentCodec {
+        ResolvedComponentCodec {
             component_id: 0,
             selection: CompactChunkCodecSelection::Forced(codec),
+            requested_tolerance: None,
             max_abs_error,
         }
     }

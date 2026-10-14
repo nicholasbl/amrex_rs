@@ -46,10 +46,20 @@ pub enum CompactChunkCodecSelection {
     /// Use exact uniform chunks and the dense codec matching the scalar type.
     #[default]
     AutoLossless,
-    /// Select the smallest codec satisfying `max_abs_error`.
+    /// Select the smallest codec satisfying the configured error tolerance.
     AutoSmallest,
     /// Require one codec for every non-uniform chunk.
     Forced(CompactChunkCodec),
+}
+
+/// Maximum pointwise error accepted from a lossy chunk codec.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompactErrorTolerance {
+    /// Maximum absolute error in the reconstructed scalar domain.
+    Absolute(f64),
+    /// Maximum absolute error as a fraction of the component's global observed
+    /// range in the reconstructed scalar domain.
+    RangeFraction(f64),
 }
 
 /// Per-component chunk-codec policy.
@@ -59,9 +69,8 @@ pub struct CompactComponentCodec {
     pub component_id: u32,
     /// Automatic or forced codec selection.
     pub selection: CompactChunkCodecSelection,
-    /// Required for lossy automatic or forced codecs. The value is in the
-    /// reconstructed scalar domain (`[0, 1]` for `UNorm32`).
-    pub max_abs_error: Option<f64>,
+    /// Required for lossy automatic or forced codecs.
+    pub error_tolerance: Option<CompactErrorTolerance>,
 }
 
 /// Policy for non-finite plotfile samples encountered during compaction.
