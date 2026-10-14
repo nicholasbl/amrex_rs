@@ -1,5 +1,6 @@
 mod sparse_grid3;
 
 pub(crate) use sparse_grid3::{
-    Aabb3u, CHUNK_BITS, CHUNK_VOLUME, GridAccessor, MASK_WORDS, SparseGrid3, SparseGridChunkView,
+    Aabb3u, CHUNK_BITS, CHUNK_SIZE, CHUNK_VOLUME, GridAccessor, MASK_WORDS, SparseGrid3,
+    SparseGridChunkView,
 };

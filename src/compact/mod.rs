@@ -17,7 +17,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use crate::sparse_amr::{SparseAmr, SparseAmrLevel};
-use crate::utility::{Aabb3u, SparseGrid3};
+use crate::utility::{Aabb3u, CHUNK_SIZE, MASK_WORDS, SparseGrid3};
 use crate::{CoordinateSystem, PlotFile, Variable};
 
 use anyhow::{Context, Result, ensure};
@@ -1492,7 +1492,7 @@ pub(crate) fn build_active_dual_cubes<T>(
     sample_regions: &[Aabb3u],
 ) -> SparseGrid3<()>
 where
-    T: Copy + PartialEq,
+    T: Copy + PartialEq + Sync,
 {
     let sample_bounds = samples.bounds();
     let cube_bounds = UVec3::new(
@@ -1515,21 +1515,49 @@ where
         candidates.fill_aabb(candidate_region, ());
     }
 
-    let mut active = SparseGrid3::with_chunk_capacity(cube_bounds, candidates.chunk_count());
-    let mut accessor = samples.accessor();
-    candidates.for_each_present_in_aabb(candidates.bounds_aabb(), |anchor, ()| {
-        let mut complete = true;
-        for dz in 0..=1 {
-            for dy in 0..=1 {
-                for dx in 0..=1 {
-                    complete &= accessor.contains(anchor + UVec3::new(dx, dy, dz));
+    let active_chunks = candidates.par_map_chunks(|chunk| {
+        let (key, mask) = match chunk {
+            crate::utility::SparseGridChunkView::Uniform { key, mask, .. }
+            | crate::utility::SparseGridChunkView::Dense { key, mask, .. } => (key, mask),
+        };
+        let chunk_min = key * CHUNK_SIZE;
+        let mut active_mask = [0_u64; MASK_WORDS];
+        let mut accessor = samples.accessor();
+        for (word_index, &word) in mask.iter().enumerate() {
+            let mut remaining = word;
+            while remaining != 0 {
+                let bit = remaining.trailing_zeros() as usize;
+                let index = word_index * u64::BITS as usize + bit;
+                let x = index % CHUNK_SIZE as usize;
+                let y = (index / CHUNK_SIZE as usize) % CHUNK_SIZE as usize;
+                let z = index / (CHUNK_SIZE as usize * CHUNK_SIZE as usize);
+                let anchor = chunk_min + UVec3::new(x as u32, y as u32, z as u32);
+                let mut complete = true;
+                for dz in 0..=1 {
+                    for dy in 0..=1 {
+                        for dx in 0..=1 {
+                            complete &= accessor.contains(anchor + UVec3::new(dx, dy, dz));
+                        }
+                    }
                 }
+                if complete {
+                    active_mask[word_index] |= 1_u64 << bit;
+                }
+                remaining &= remaining - 1;
             }
         }
-        if complete {
-            active.set(anchor, ());
-        }
+        active_mask
+            .iter()
+            .any(|&word| word != 0)
+            .then_some((key, active_mask))
     });
+    drop(candidates);
+    let mut active_chunks = active_chunks.into_iter().flatten().collect::<Vec<_>>();
+    active_chunks.sort_by_key(|(key, _)| (key.z, key.y, key.x));
+    let mut active = SparseGrid3::with_chunk_capacity(cube_bounds, active_chunks.len());
+    for (key, mask) in active_chunks {
+        active.insert_uniform_chunk(key, (), mask);
+    }
     active
 }
 
@@ -1848,6 +1876,33 @@ mod tests {
         assert_eq!(ranges.len(), 2);
         assert_eq!((ranges[0].min, ranges[0].max), (0.0, 1.0));
         assert_eq!((ranges[1].min, ranges[1].max), (1.0, 1.0));
+    }
+
+    #[test]
+    fn parallel_active_cubes_match_sample_presence_across_chunks() {
+        let bounds = UVec3::new(CHUNK_SIZE * 2 + 3, 3, 3);
+        let mut samples = SparseGrid3::new(bounds);
+        samples.fill_aabb(samples.bounds_aabb(), 1_u8);
+        assert!(samples.clear(UVec3::new(CHUNK_SIZE, 1, 1)));
+
+        let active = build_active_dual_cubes(&samples, &[samples.bounds_aabb()]);
+        let cube_bounds = bounds - UVec3::ONE;
+        for z in 0..cube_bounds.z {
+            for y in 0..cube_bounds.y {
+                for x in 0..cube_bounds.x {
+                    let anchor = UVec3::new(x, y, z);
+                    let mut expected = true;
+                    for dz in 0..=1 {
+                        for dy in 0..=1 {
+                            for dx in 0..=1 {
+                                expected &= samples.contains(anchor + UVec3::new(dx, dy, dz));
+                            }
+                        }
+                    }
+                    assert_eq!(active.contains(anchor), expected, "anchor {anchor:?}");
+                }
+            }
+        }
     }
 
     #[test]

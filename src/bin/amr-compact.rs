@@ -119,7 +119,8 @@ fn main() -> Result<()> {
         timings.stages.other.as_secs_f64(),
     );
     eprintln!(
-        "compaction work: levels {}, components {}, patches {}, component-patches {}, scalar samples {}, scalar chunks {}, active-cube chunks {}, value ranges {}",
+        "compaction work: rayon threads {}, levels {}, components {}, patches {}, component-patches {}, scalar samples {}, scalar chunks {}, active-cube chunks {}, value ranges {}",
+        rayon::current_num_threads(),
         timings.work.level_count,
         timings.work.component_count,
         timings.work.patch_count,

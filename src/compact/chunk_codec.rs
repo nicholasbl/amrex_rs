@@ -25,7 +25,7 @@ pub(super) const CODEC_AFFINE_RESIDUAL_U16: u32 = 10;
 pub(super) const CODEC_AFFINE_RESIDUAL_U32: u32 = 11;
 const CODEC_VERSION: u16 = 1;
 
-trait Scalar: Copy + PartialEq + Default {
+trait Scalar: Copy + PartialEq + Default + Sync {
     const TYPE: u8;
     const WIDTH: usize;
 
@@ -98,11 +98,31 @@ impl Scalar for u32 {
     }
 }
 
-struct Candidate {
+struct EncodedCandidate {
     codec: CompactChunkCodec,
     max_abs_error: f64,
     metadata: Vec<u8>,
     payload: Vec<u8>,
+}
+
+struct Candidate<T> {
+    codec: CompactChunkCodec,
+    max_abs_error: f64,
+    plan: CandidatePlan<T>,
+}
+
+#[derive(Clone, Copy)]
+enum CandidatePlan<T> {
+    DenseNative,
+    DenseF32,
+    Uniform(T),
+    Quantized {
+        coefficients: Option<[f64; 4]>,
+        min: f64,
+        step: f64,
+        bits: u8,
+    },
+    Affine([f64; 4]),
 }
 
 #[derive(Clone, Copy)]
@@ -123,9 +143,20 @@ impl ErrorMetric {
     }
 }
 
-impl Candidate {
+impl<T: Scalar> Candidate<T> {
     fn stored_len(&self) -> usize {
-        self.metadata.len() + self.payload.len()
+        match self.plan {
+            CandidatePlan::DenseNative => CHUNK_VOLUME * T::WIDTH,
+            CandidatePlan::DenseF32 => CHUNK_VOLUME * 4,
+            CandidatePlan::Uniform(_) => 8,
+            CandidatePlan::Quantized {
+                coefficients, bits, ..
+            } => {
+                let metadata = if coefficients.is_some() { 48 } else { 16 };
+                metadata + CHUNK_VOLUME * usize::from(bits / 8)
+            }
+            CandidatePlan::Affine(_) => 32,
+        }
     }
 }
 
@@ -171,34 +202,21 @@ fn encode_grid<T: Scalar>(
         "invalid codec physical-domain transform"
     );
 
-    let mut result = Ok(());
-    let mut chunks = Vec::with_capacity(grid.chunk_count());
-    grid.for_each_chunk(|chunk| {
-        if result.is_err() {
-            return;
-        }
-        let encoded = match chunk {
-            SparseGridChunkView::Uniform { key, value, mask } => Ok(ArchiveScalarChunk {
-                key: uvec3_to_array(key),
-                mask: Box::new(mask),
-                codec_id: CODEC_UNIFORM,
-                codec_version: CODEC_VERSION,
-                codec_flags: 0,
-                max_abs_error: 0.0,
-                metadata: encode_uniform(value),
-                payload_length: 0,
-                payload: Vec::new(),
-            }),
-            SparseGridChunkView::Dense { key, values, mask } => {
-                encode_dense(key, values, mask, policy)
-            }
-        };
-        match encoded {
-            Ok(chunk) => chunks.push(chunk),
-            Err(error) => result = Err(error),
-        }
+    let encoded = grid.par_map_chunks(|chunk| match chunk {
+        SparseGridChunkView::Uniform { key, value, mask } => Ok(ArchiveScalarChunk {
+            key: uvec3_to_array(key),
+            mask: Box::new(mask),
+            codec_id: CODEC_UNIFORM,
+            codec_version: CODEC_VERSION,
+            codec_flags: 0,
+            max_abs_error: 0.0,
+            metadata: encode_uniform(value),
+            payload_length: 0,
+            payload: Vec::new(),
+        }),
+        SparseGridChunkView::Dense { key, values, mask } => encode_dense(key, values, mask, policy),
     });
-    result?;
+    let mut chunks = encoded.into_iter().collect::<Result<Vec<_>>>()?;
     chunks.sort_by_key(|chunk| chunk.key);
     Ok(ArchiveScalarGrid {
         bounds: uvec3_to_array(grid.bounds()),
@@ -214,8 +232,9 @@ fn encode_dense<T: Scalar>(
     policy: ResolvedComponentCodec,
 ) -> Result<ArchiveScalarChunk> {
     ensure!(values.len() == CHUNK_VOLUME, "invalid dense chunk length");
-    let best = select_candidate(values, &mask, policy)
+    let selected = select_candidate(values, &mask, policy)
         .with_context(|| format!("encoding chunk ({}, {}, {})", key.x, key.y, key.z))?;
+    let best = materialize_candidate(selected, values, &mask);
 
     let (payload_length, payload) = pack_payload(&best.payload)?;
     Ok(ArchiveScalarChunk {
@@ -231,11 +250,95 @@ fn encode_dense<T: Scalar>(
     })
 }
 
+fn materialize_candidate<T: Scalar>(
+    candidate: Candidate<T>,
+    values: &[T],
+    mask: &[u64; MASK_WORDS],
+) -> EncodedCandidate {
+    let Candidate {
+        codec,
+        max_abs_error,
+        plan,
+    } = candidate;
+    let (metadata, payload) = match plan {
+        CandidatePlan::DenseNative => {
+            let mut payload = Vec::with_capacity(values.len() * T::WIDTH);
+            for &value in values {
+                value.append_raw(&mut payload);
+            }
+            (Vec::new(), payload)
+        }
+        CandidatePlan::DenseF32 => {
+            let mut payload = Vec::with_capacity(CHUNK_VOLUME * 4);
+            for &value in values {
+                (value.to_domain() as f32).append_raw(&mut payload);
+            }
+            (Vec::new(), payload)
+        }
+        CandidatePlan::Uniform(value) => (encode_uniform(value), Vec::new()),
+        CandidatePlan::Quantized {
+            coefficients,
+            min,
+            step,
+            bits,
+        } => {
+            let mut metadata = Vec::with_capacity(if coefficients.is_some() { 48 } else { 16 });
+            if let Some(coefficients) = coefficients {
+                append_f64s(&mut metadata, &coefficients);
+            }
+            append_f64s(&mut metadata, &[min, step]);
+            let mut payload = Vec::with_capacity(CHUNK_VOLUME * usize::from(bits / 8));
+            for (index, &value) in values.iter().enumerate() {
+                let code = if present(mask, index) {
+                    quantized_code(value.to_domain(), index, coefficients, min, step, bits)
+                } else {
+                    0
+                };
+                append_code(&mut payload, bits, code);
+            }
+            (metadata, payload)
+        }
+        CandidatePlan::Affine(coefficients) => {
+            let mut metadata = Vec::with_capacity(32);
+            append_f64s(&mut metadata, &coefficients);
+            (metadata, Vec::new())
+        }
+    };
+    EncodedCandidate {
+        codec,
+        max_abs_error,
+        metadata,
+        payload,
+    }
+}
+
+fn quantized_code(
+    value: f64,
+    index: usize,
+    coefficients: Option<[f64; 4]>,
+    min: f64,
+    step: f64,
+    bits: u8,
+) -> u64 {
+    if step == 0.0 {
+        return 0;
+    }
+    let code_max = match bits {
+        8 => u8::MAX as u64,
+        16 => u16::MAX as u64,
+        32 => u32::MAX as u64,
+        _ => unreachable!(),
+    };
+    (((value - coefficients.map_or(0.0, |c| predict(c, index)) - min) / step)
+        .round()
+        .clamp(0.0, code_max as f64)) as u64
+}
+
 fn select_candidate<T: Scalar>(
     values: &[T],
     mask: &[u64; MASK_WORDS],
     policy: ResolvedComponentCodec,
-) -> Result<Candidate> {
+) -> Result<Candidate<T>> {
     match policy.selection {
         CompactChunkCodecSelection::AutoLossless => {
             ensure!(
@@ -391,15 +494,13 @@ fn dense_f32_candidate<T: Scalar>(
     values: &[T],
     mask: &[u64; MASK_WORDS],
     metric: ErrorMetric,
-) -> Option<Candidate> {
+) -> Option<Candidate<T>> {
     if T::TYPE == TYPE_F32 {
         return None;
     }
-    let mut payload = Vec::with_capacity(CHUNK_VOLUME * 4);
     let mut error = 0.0_f64;
     for (index, &value) in values.iter().enumerate() {
         let stored = value.to_domain() as f32;
-        stored.append_raw(&mut payload);
         if present(mask, index) {
             let reconstructed = T::from_domain(f64::from(stored)).to_domain();
             if !reconstructed.is_finite() {
@@ -415,22 +516,17 @@ fn dense_f32_candidate<T: Scalar>(
     Some(Candidate {
         codec: CompactChunkCodec::DenseF32,
         max_abs_error: error,
-        metadata: Vec::new(),
-        payload,
+        plan: CandidatePlan::DenseF32,
     })
 }
 
-fn choose_smaller(best: &mut Candidate, candidate: Candidate) {
+fn choose_smaller<T: Scalar>(best: &mut Candidate<T>, candidate: Candidate<T>) {
     if candidate.stored_len() < best.stored_len() {
         *best = candidate;
     }
 }
 
-fn dense_native_candidate<T: Scalar>(values: &[T]) -> Candidate {
-    let mut payload = Vec::with_capacity(values.len() * T::WIDTH);
-    for &value in values {
-        value.append_raw(&mut payload);
-    }
+fn dense_native_candidate<T: Scalar>(_values: &[T]) -> Candidate<T> {
     Candidate {
         codec: match T::TYPE {
             TYPE_F32 => CompactChunkCodec::DenseF32,
@@ -439,8 +535,7 @@ fn dense_native_candidate<T: Scalar>(values: &[T]) -> Candidate {
             _ => unreachable!(),
         },
         max_abs_error: 0.0,
-        metadata: Vec::new(),
-        payload,
+        plan: CandidatePlan::DenseNative,
     }
 }
 
@@ -448,7 +543,7 @@ fn approximate_uniform<T: Scalar>(
     values: &[T],
     mask: &[u64; MASK_WORDS],
     metric: ErrorMetric,
-) -> Option<Candidate> {
+) -> Option<Candidate<T>> {
     let (min, max) = present_range(values, mask)?;
     let center = min + (max - min) * 0.5;
     let decoded = T::from_domain(center);
@@ -457,8 +552,7 @@ fn approximate_uniform<T: Scalar>(
     Some(Candidate {
         codec: CompactChunkCodec::UniformF64,
         max_abs_error: error,
-        metadata: encode_uniform(decoded),
-        payload: Vec::new(),
+        plan: CandidatePlan::Uniform(decoded),
     })
 }
 
@@ -468,7 +562,7 @@ fn quantized_candidate<T: Scalar>(
     metric: ErrorMetric,
     affine: Option<[f64; 4]>,
     bit_widths: &[u8],
-) -> Option<Candidate> {
+) -> Option<Candidate<T>> {
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
     for (index, &value) in values.iter().enumerate() {
@@ -498,18 +592,10 @@ fn quantized_candidate<T: Scalar>(
             continue;
         }
 
-        let mut payload = Vec::with_capacity(CHUNK_VOLUME * usize::from(bits / 8));
         let mut error = 0.0_f64;
         for (index, &value) in values.iter().enumerate() {
-            let code = if present(mask, index) && step != 0.0 {
-                (((value.to_domain() - affine.map_or(0.0, |c| predict(c, index)) - min) / step)
-                    .round()
-                    .clamp(0.0, code_max as f64)) as u64
-            } else {
-                0
-            };
-            append_code(&mut payload, bits, code);
             if present(mask, index) {
+                let code = quantized_code(value.to_domain(), index, affine, min, step, bits);
                 let reconstructed =
                     affine.map_or(0.0, |c| predict(c, index)) + min + code as f64 * step;
                 let actual = T::from_domain(reconstructed).to_domain();
@@ -522,11 +608,6 @@ fn quantized_candidate<T: Scalar>(
             }
         }
         if error.is_finite() {
-            let mut metadata = Vec::with_capacity(if affine.is_some() { 48 } else { 16 });
-            if let Some(coefficients) = affine {
-                append_f64s(&mut metadata, &coefficients);
-            }
-            append_f64s(&mut metadata, &[min, step]);
             return Some(Candidate {
                 codec: match (affine.is_some(), bits) {
                     (false, 8) => CompactChunkCodec::QuantizedU8,
@@ -538,8 +619,12 @@ fn quantized_candidate<T: Scalar>(
                     _ => unreachable!(),
                 },
                 max_abs_error: error,
-                metadata,
-                payload,
+                plan: CandidatePlan::Quantized {
+                    coefficients: affine,
+                    min,
+                    step,
+                    bits,
+                },
             });
         }
     }
@@ -551,19 +636,14 @@ fn affine_candidate<T: Scalar>(
     mask: &[u64; MASK_WORDS],
     metric: ErrorMetric,
     coefficients: [f64; 4],
-) -> Option<Candidate> {
+) -> Option<Candidate<T>> {
     let error = present_max_error(values, mask, metric, |index| {
         T::from_domain(predict(coefficients, index)).to_domain()
     })?;
-    Some({
-        let mut metadata = Vec::with_capacity(32);
-        append_f64s(&mut metadata, &coefficients);
-        Candidate {
-            codec: CompactChunkCodec::AffineF64,
-            max_abs_error: error,
-            metadata,
-            payload: Vec::new(),
-        }
+    Some(Candidate {
+        codec: CompactChunkCodec::AffineF64,
+        max_abs_error: error,
+        plan: CandidatePlan::Affine(coefficients),
     })
 }
 
@@ -1083,6 +1163,37 @@ mod tests {
                 expected
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_encoding_sorts_chunk_directory() -> Result<()> {
+        let bounds = UVec3::new(CHUNK_SIZE * 3, CHUNK_SIZE, CHUNK_SIZE);
+        let mut grid = SparseGrid3::new(bounds);
+        let values = (0..bounds.x as usize * bounds.y as usize * bounds.z as usize)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        grid.write_aabb_values(grid.bounds_aabb(), &values)
+            .map_err(|error| anyhow::anyhow!("writing test grid: {error:?}"))?;
+
+        let archive = encode_f32(
+            &grid,
+            ResolvedComponentCodec {
+                component_id: 0,
+                selection: CompactChunkCodecSelection::AutoLossless,
+                error_tolerance: None,
+                physical_offset: 0.0,
+                physical_scale: 1.0,
+            },
+        )?;
+        assert_eq!(
+            archive
+                .chunks
+                .iter()
+                .map(|chunk| chunk.key)
+                .collect::<Vec<_>>(),
+            vec![[0, 0, 0], [1, 0, 0], [2, 0, 0]]
+        );
         Ok(())
     }
 }

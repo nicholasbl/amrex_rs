@@ -120,6 +120,34 @@ where
         }
     }
 
+    pub(crate) fn par_map_chunks<R, F>(&self, f: F) -> Vec<R>
+    where
+        T: Sync,
+        R: Send,
+        F: Fn(SparseGridChunkView<'_, T>) -> R + Sync + Send,
+    {
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+
+        self.chunks
+            .par_iter()
+            .map(|(&key, chunk)| {
+                let key = UVec3::new(key.x, key.y, key.z);
+                match chunk {
+                    Chunk::Uniform { value, mask } => f(SparseGridChunkView::Uniform {
+                        key,
+                        value: *value,
+                        mask: mask.words(),
+                    }),
+                    Chunk::Dense { values, mask } => f(SparseGridChunkView::Dense {
+                        key,
+                        values,
+                        mask: mask.words(),
+                    }),
+                }
+            })
+            .collect()
+    }
+
     pub(crate) fn chunk_aabbs(&self) -> Vec<Aabb3u> {
         let mut aabbs = self
             .chunks
