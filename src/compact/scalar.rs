@@ -3,25 +3,65 @@ use glam::{I64Vec3, UVec3};
 
 use crate::utility::{Aabb3u, GridAccessor, SparseGrid3};
 
-/// On-disk scalar representation for one compact quantity.
+/// Scalar type reconstructed when a compact quantity is loaded.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub enum CompactScalarEncoding {
-    /// Store IEEE-754 single-precision values.
+pub enum CompactScalarType {
+    /// Reconstruct IEEE-754 single-precision values.
     #[default]
     F32,
-    /// Store IEEE-754 double-precision values.
+    /// Reconstruct IEEE-754 double-precision values.
     F64,
     /// Quantize one global physical range uniformly over all `u32` codes.
     UNorm32 { min: f64, max: f64 },
 }
 
-/// Per-component scalar encoding override.
+/// Per-component reconstructed scalar-type override.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CompactComponentEncoding {
+pub struct CompactComponentScalarType {
     /// Plotfile component id.
     pub component_id: u32,
-    /// Representation used by every AMR level for this component.
-    pub encoding: CompactScalarEncoding,
+    /// Scalar type used by every AMR level for this component.
+    pub scalar_type: CompactScalarType,
+}
+
+/// A concrete on-disk chunk codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactChunkCodec {
+    UniformF64,
+    DenseF32,
+    DenseF64,
+    DenseU32,
+    QuantizedU8,
+    QuantizedU16,
+    QuantizedU32,
+    AffineF64,
+    AffineResidualU8,
+    AffineResidualU16,
+    AffineResidualU32,
+}
+
+/// How the writer chooses a codec for dense chunks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CompactChunkCodecSelection {
+    /// Use exact uniform chunks and the dense codec matching the scalar type.
+    #[default]
+    AutoLossless,
+    /// Select the smallest codec satisfying `max_abs_error`.
+    AutoSmallest,
+    /// Require one codec for every non-uniform chunk.
+    Forced(CompactChunkCodec),
+}
+
+/// Per-component chunk-codec policy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactComponentCodec {
+    /// Plotfile component id.
+    pub component_id: u32,
+    /// Automatic or forced codec selection.
+    pub selection: CompactChunkCodecSelection,
+    /// Required for lossy automatic or forced codecs. The value is in the
+    /// reconstructed scalar domain (`[0, 1]` for `UNorm32`).
+    pub max_abs_error: Option<f64>,
 }
 
 /// Policy for non-finite plotfile samples encountered during compaction.
@@ -31,7 +71,7 @@ pub enum NonFinitePolicy {
     #[default]
     ReplaceWithZero,
     /// Skip finiteness checks. The caller guarantees that all values are finite
-    /// and representable by their selected encodings.
+    /// and representable by their selected scalar types.
     AssumeFinite,
 }
 
@@ -59,7 +99,7 @@ pub(crate) enum CompactScalarAccessor<'a> {
     UNorm32(GridAccessor<'a, u32>),
 }
 
-impl CompactScalarEncoding {
+impl CompactScalarType {
     pub(crate) fn validate(self) -> Result<()> {
         if let Self::UNorm32 { min, max } = self {
             ensure!(min.is_finite(), "UNorm32 minimum must be finite");
@@ -75,16 +115,16 @@ impl CompactScalarGrid {
     pub(crate) fn new(
         bounds: UVec3,
         chunk_capacity: usize,
-        encoding: CompactScalarEncoding,
+        scalar_type: CompactScalarType,
     ) -> Self {
-        match encoding {
-            CompactScalarEncoding::F32 => {
+        match scalar_type {
+            CompactScalarType::F32 => {
                 Self::F32(SparseGrid3::with_chunk_capacity(bounds, chunk_capacity))
             }
-            CompactScalarEncoding::F64 => {
+            CompactScalarType::F64 => {
                 Self::F64(SparseGrid3::with_chunk_capacity(bounds, chunk_capacity))
             }
-            CompactScalarEncoding::UNorm32 { min, max } => Self::UNorm32 {
+            CompactScalarType::UNorm32 { min, max } => Self::UNorm32 {
                 values: SparseGrid3::with_chunk_capacity(bounds, chunk_capacity),
                 min,
                 max,

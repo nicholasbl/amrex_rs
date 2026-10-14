@@ -1,6 +1,6 @@
 use std::{env, fs::File, path::PathBuf};
 
-use amrex_rs::{CompactComponentStats, CompactScalarEncoding, read_compact, view_compact};
+use amrex_rs::{CompactComponentStats, CompactScalarType, read_compact, view_compact};
 use anyhow::{Context, Result, ensure};
 
 fn usage(program: &str) -> String {
@@ -51,18 +51,18 @@ fn format_bytes(bytes: u128) -> String {
     }
 }
 
-fn scalar_width(encoding: CompactScalarEncoding) -> u128 {
-    match encoding {
-        CompactScalarEncoding::F32 | CompactScalarEncoding::UNorm32 { .. } => 4,
-        CompactScalarEncoding::F64 => 8,
+fn scalar_width(scalar_type: CompactScalarType) -> u128 {
+    match scalar_type {
+        CompactScalarType::F32 | CompactScalarType::UNorm32 { .. } => 4,
+        CompactScalarType::F64 => 8,
     }
 }
 
 fn dense_scalar_payload_size(
     index_domains: &[([i32; 3], [i32; 3], [i32; 3])],
-    encodings: &[CompactScalarEncoding],
+    scalar_types: &[CompactScalarType],
 ) -> Result<u128> {
-    let bytes_per_cell = encodings.iter().copied().map(scalar_width).sum::<u128>();
+    let bytes_per_cell = scalar_types.iter().copied().map(scalar_width).sum::<u128>();
     let mut total = 0_u128;
 
     for (level, &(min, max, _)) in index_domains.iter().enumerate() {
@@ -115,11 +115,11 @@ fn main() -> Result<()> {
     println!("levels: {}", view.level_count());
 
     let index_domains = view.index_domains().collect::<Vec<_>>();
-    let component_encodings = view
-        .component_encodings()
-        .map(|(_, encoding)| encoding)
+    let component_scalar_types = view
+        .component_scalar_types()
+        .map(|(_, scalar_type)| scalar_type)
         .collect::<Vec<_>>();
-    let dense_size = dense_scalar_payload_size(&index_domains, &component_encodings)?;
+    let dense_size = dense_scalar_payload_size(&index_domains, &component_scalar_types)?;
     println!(
         "dense scalar payload estimate: {}",
         format_bytes(dense_size)
@@ -155,6 +155,23 @@ fn main() -> Result<()> {
         );
     }
 
+    let codec_stats = view.chunk_codec_stats()?;
+    if !codec_stats.is_empty() {
+        println!("chunk codecs:");
+        for stats in codec_stats {
+            let name = stats.codec_name().unwrap_or("unknown");
+            println!(
+                "  component {:>3}: {name} id={} version={} chunks={} codec-bytes={} max-error={:.7e}",
+                stats.component_id,
+                stats.codec_id,
+                stats.codec_version,
+                stats.chunk_count,
+                format_bytes(u128::from(stats.stored_bytes)),
+                stats.max_abs_error,
+            );
+        }
+    }
+
     let compact = read_compact(&bytes)
         .with_context(|| format!("loading compact archive {}", path.display()))?;
     ensure!(
@@ -185,14 +202,14 @@ fn main() -> Result<()> {
             .component_normalization(component_id)
             .map(|(min, max)| format!(", normalized from [{min:.7e}, {max:.7e}]"))
             .unwrap_or_default();
-        let encoding = match compact.component_encoding(component_id) {
-            Some(CompactScalarEncoding::F32) => "f32",
-            Some(CompactScalarEncoding::F64) => "f64",
-            Some(CompactScalarEncoding::UNorm32 { .. }) => "unorm32",
+        let scalar_type = match compact.component_scalar_type(component_id) {
+            Some(CompactScalarType::F32) => "f32",
+            Some(CompactScalarType::F64) => "f64",
+            Some(CompactScalarType::UNorm32 { .. }) => "unorm32",
             None => "unknown",
         };
         println!(
-            "  [{component_id:>3}] {:<24} {} values={} encoding={encoding}{nan_suffix}{normalization_suffix}",
+            "  [{component_id:>3}] {:<24} {} values={} scalar-type={scalar_type}{nan_suffix}{normalization_suffix}",
             variable.name,
             format_range(stats),
             stats.value_count
@@ -207,16 +224,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dense_estimate_uses_inclusive_domains_and_encoding_widths() -> Result<()> {
+    fn dense_estimate_uses_inclusive_domains_and_scalar_widths() -> Result<()> {
         let domains = [([0, 0, 0], [1, 2, 3], [0, 0, 0])];
-        let encodings = [
-            CompactScalarEncoding::F32,
-            CompactScalarEncoding::F64,
-            CompactScalarEncoding::UNorm32 { min: 0.0, max: 1.0 },
+        let scalar_types = [
+            CompactScalarType::F32,
+            CompactScalarType::F64,
+            CompactScalarType::UNorm32 { min: 0.0, max: 1.0 },
         ];
 
         // 2 * 3 * 4 cells, with 4 + 8 + 4 bytes per cell.
-        assert_eq!(dense_scalar_payload_size(&domains, &encodings)?, 384);
+        assert_eq!(dense_scalar_payload_size(&domains, &scalar_types)?, 384);
         Ok(())
     }
 

@@ -6,7 +6,8 @@ use std::{
 };
 
 use amrex_rs::{
-    CompactComponentEncoding, CompactOptions, CompactScalarEncoding, NonFinitePolicy, PlotFile,
+    CompactChunkCodec, CompactChunkCodecSelection, CompactComponentCodec,
+    CompactComponentScalarType, CompactOptions, CompactScalarType, NonFinitePolicy, PlotFile,
     write_compact,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -19,7 +20,8 @@ fn main() -> Result<()> {
         .with_context(|| format!("opening plotfile {}", args.input.display()))?;
 
     let mut ids = Vec::with_capacity(args.variables.len());
-    let mut encodings = Vec::new();
+    let mut scalar_types = Vec::new();
+    let mut codecs = Vec::new();
     for requested in args.variables {
         let variable = plotfile
             .variable(&requested.name)
@@ -31,27 +33,40 @@ fn main() -> Result<()> {
             requested.name
         );
         ids.push(component_id);
-        let encoding = match (requested.encoding, requested.normalize) {
-            (None | Some(ConfigEncoding::F32), None) => CompactScalarEncoding::F32,
-            (Some(ConfigEncoding::F64), None) => CompactScalarEncoding::F64,
-            (None | Some(ConfigEncoding::UNorm32), Some([min, max])) => {
-                CompactScalarEncoding::UNorm32 { min, max }
+        let scalar_type = match (requested.scalar_type, requested.normalize) {
+            (None | Some(ConfigScalarType::F32), None) => CompactScalarType::F32,
+            (Some(ConfigScalarType::F64), None) => CompactScalarType::F64,
+            (None | Some(ConfigScalarType::UNorm32), Some([min, max])) => {
+                CompactScalarType::UNorm32 { min, max }
             }
-            (Some(ConfigEncoding::UNorm32), None) => {
+            (Some(ConfigScalarType::UNorm32), None) => {
                 bail!(
                     "variable {:?} uses unorm32 but has no normalize bounds",
                     requested.name
                 )
             }
-            (Some(encoding), Some(_)) => bail!(
-                "variable {:?} has normalize bounds incompatible with {encoding:?}",
+            (Some(scalar_type), Some(_)) => bail!(
+                "variable {:?} has normalize bounds incompatible with {scalar_type:?}",
                 requested.name
             ),
         };
-        encodings.push(CompactComponentEncoding {
+        scalar_types.push(CompactComponentScalarType {
             component_id,
-            encoding,
+            scalar_type,
         });
+        if requested.codec.is_some() || requested.max_abs_error.is_some() {
+            let selection = requested
+                .codec
+                .as_deref()
+                .map(parse_codec)
+                .transpose()?
+                .context("max_abs_error requires an explicit codec")?;
+            codecs.push(CompactComponentCodec {
+                component_id,
+                selection,
+                max_abs_error: requested.max_abs_error,
+            });
+        }
     }
 
     let file = File::create(&args.output)
@@ -62,7 +77,8 @@ fn main() -> Result<()> {
         &plotfile,
         CompactOptions {
             component_ids: ids,
-            encodings,
+            scalar_types,
+            codecs,
             non_finite_policy: if args.assume_finite {
                 NonFinitePolicy::AssumeFinite
             } else {
@@ -118,16 +134,44 @@ struct Config {
 #[serde(deny_unknown_fields)]
 struct VariableConfig {
     name: String,
-    encoding: Option<ConfigEncoding>,
+    scalar_type: Option<ConfigScalarType>,
+    codec: Option<String>,
     normalize: Option<[f64; 2]>,
+    max_abs_error: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum ConfigEncoding {
+enum ConfigScalarType {
     F32,
     F64,
     UNorm32,
+}
+
+fn parse_codec(value: &str) -> Result<CompactChunkCodecSelection> {
+    let selection = match value {
+        "auto:lossless" => CompactChunkCodecSelection::AutoLossless,
+        "auto:smallest" => CompactChunkCodecSelection::AutoSmallest,
+        "uniform:f64" => CompactChunkCodecSelection::Forced(CompactChunkCodec::UniformF64),
+        "dense:f32" => CompactChunkCodecSelection::Forced(CompactChunkCodec::DenseF32),
+        "dense:f64" => CompactChunkCodecSelection::Forced(CompactChunkCodec::DenseF64),
+        "dense:u32" => CompactChunkCodecSelection::Forced(CompactChunkCodec::DenseU32),
+        "quantized:u8" => CompactChunkCodecSelection::Forced(CompactChunkCodec::QuantizedU8),
+        "quantized:u16" => CompactChunkCodecSelection::Forced(CompactChunkCodec::QuantizedU16),
+        "quantized:u32" => CompactChunkCodecSelection::Forced(CompactChunkCodec::QuantizedU32),
+        "affine:f64" => CompactChunkCodecSelection::Forced(CompactChunkCodec::AffineF64),
+        "affine-residual:u8" => {
+            CompactChunkCodecSelection::Forced(CompactChunkCodec::AffineResidualU8)
+        }
+        "affine-residual:u16" => {
+            CompactChunkCodecSelection::Forced(CompactChunkCodec::AffineResidualU16)
+        }
+        "affine-residual:u32" => {
+            CompactChunkCodecSelection::Forced(CompactChunkCodec::AffineResidualU32)
+        }
+        _ => bail!("unsupported chunk codec {value:?}; expected family:value"),
+    };
+    Ok(selection)
 }
 
 impl Args {
@@ -182,8 +226,10 @@ impl Args {
                 .into_iter()
                 .map(|name| VariableConfig {
                     name,
-                    encoding: None,
+                    scalar_type: None,
+                    codec: None,
                     normalize: None,
+                    max_abs_error: None,
                 })
                 .collect(),
             assume_finite: false,
@@ -205,12 +251,15 @@ mod tests {
 
                 [[variables]]
                 name = "density"
-                encoding = "unorm32"
+                scalar_type = "unorm32"
+                codec = "auto:smallest"
                 normalize = [1.0e20, 1.000000001e20]
+                max_abs_error = 1.0e-6
 
                 [[variables]]
                 name = "temperature"
-                encoding = "f64"
+                scalar_type = "f64"
+                codec = "dense:f64"
             "#,
         )?;
 
@@ -227,15 +276,22 @@ mod tests {
             config.variables[0].normalize == Some([1.0e20, 1.000000001e20]),
             "normalization bounds changed while parsing"
         );
+        ensure!(config.variables[0].max_abs_error == Some(1.0e-6));
+        ensure!(
+            parse_codec(config.variables[0].codec.as_deref().unwrap())?
+                == CompactChunkCodecSelection::AutoSmallest
+        );
         ensure!(
             config.variables[1].normalize.is_none(),
             "optional normalization unexpectedly present"
         );
         ensure!(config.assume_finite, "assume_finite changed while parsing");
         ensure!(
-            matches!(config.variables[0].encoding, Some(ConfigEncoding::UNorm32))
-                && matches!(config.variables[1].encoding, Some(ConfigEncoding::F64)),
-            "scalar encodings changed while parsing"
+            matches!(
+                config.variables[0].scalar_type,
+                Some(ConfigScalarType::UNorm32)
+            ) && matches!(config.variables[1].scalar_type, Some(ConfigScalarType::F64)),
+            "scalar types changed while parsing"
         );
         Ok(())
     }
@@ -253,6 +309,32 @@ mod tests {
         ensure!(config.input.is_none(), "unexpected config input");
         ensure!(config.output.is_none(), "unexpected config output");
         ensure!(config.variables.len() == 1, "unexpected variable count");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_standard_codec_names() -> Result<()> {
+        let cases = [
+            ("auto:lossless", CompactChunkCodecSelection::AutoLossless),
+            ("auto:smallest", CompactChunkCodecSelection::AutoSmallest),
+            (
+                "dense:f64",
+                CompactChunkCodecSelection::Forced(CompactChunkCodec::DenseF64),
+            ),
+            (
+                "quantized:u16",
+                CompactChunkCodecSelection::Forced(CompactChunkCodec::QuantizedU16),
+            ),
+            (
+                "affine-residual:u8",
+                CompactChunkCodecSelection::Forced(CompactChunkCodec::AffineResidualU8),
+            ),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(parse_codec(name)?, expected);
+        }
+        assert!(parse_codec("raw:f64").is_err());
+        assert!(parse_codec("quantized:16").is_err());
         Ok(())
     }
 }

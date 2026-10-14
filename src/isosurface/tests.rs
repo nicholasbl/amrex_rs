@@ -4,7 +4,7 @@ use super::dual_grid::{DualGridLevel, build_active_dual_cubes};
 use super::mc33::mesh_level_aabb as mesh_level_mc33_aabb;
 use super::sampling::sampled_values_on_edge;
 use super::*;
-use crate::compact::{CompactScalarEncoding, CompactScalarGrid};
+use crate::compact::{CompactScalarGrid, CompactScalarType};
 use crate::sparse_amr::level_translation;
 use crate::utility::{Aabb3u, SparseGrid3};
 use glam::{DVec3, I64Vec3, IVec3, U16Vec2, UVec3, Vec3};
@@ -188,7 +188,7 @@ fn public_mesher_extracts_across_active_chunks() -> Result<()> {
         variable_count: 1,
         refinement_ratios: Vec::new(),
         component_ids: vec![0],
-        encodings: vec![CompactScalarEncoding::F32],
+        scalar_types: vec![CompactScalarType::F32],
         levels: vec![crate::compact::CompactLevel {
             level_index: 0,
             index_origin: IVec3::ZERO,
@@ -419,7 +419,7 @@ fn single_plane_compact() -> CompactPlot {
         variable_count: 1,
         refinement_ratios: Vec::new(),
         component_ids: vec![0],
-        encodings: vec![CompactScalarEncoding::F32],
+        scalar_types: vec![CompactScalarType::F32],
         levels: vec![crate::compact::CompactLevel {
             level_index: 0,
             index_origin: IVec3::ZERO,

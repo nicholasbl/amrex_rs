@@ -4,10 +4,12 @@
 //! can be reused by isosurface extraction without rereading AMReX FAB shards.
 
 mod archive;
+mod chunk_codec;
 pub(crate) mod scalar;
 
 pub use scalar::{
-    CompactComponentEncoding, CompactScalarEncoding, NonFinitePolicy, NonFiniteReplacement,
+    CompactChunkCodec, CompactChunkCodecSelection, CompactComponentCodec,
+    CompactComponentScalarType, CompactScalarType, NonFinitePolicy, NonFiniteReplacement,
 };
 
 use std::io::Write;
@@ -29,8 +31,11 @@ pub(crate) use scalar::{CompactScalarAccessor, CompactScalarGrid};
 pub struct CompactOptions {
     /// Component ids to include. Empty means all plotfile variables.
     pub component_ids: Vec<u32>,
-    /// Optional per-component encoding overrides. Unlisted components use f32.
-    pub encodings: Vec<CompactComponentEncoding>,
+    /// Optional reconstructed scalar-type overrides. Unlisted components use f32.
+    pub scalar_types: Vec<CompactComponentScalarType>,
+    /// Optional per-component chunk-codec policies. Unlisted components use
+    /// `AutoLossless`.
+    pub codecs: Vec<CompactComponentCodec>,
     /// How non-finite source samples are handled.
     pub non_finite_policy: NonFinitePolicy,
 }
@@ -60,16 +65,18 @@ pub fn write_compact(
     let now = Instant::now();
 
     let component_ids = selected_component_ids(plot_file, &options)?;
-    let encodings = selected_encodings(&component_ids, &options)?;
-    let (compact, replacement_counts) = CompactPlot::load_with_encodings(
+    let scalar_types = selected_scalar_types(&component_ids, &options)?;
+    let codecs = selected_codecs(&component_ids, &scalar_types, &options)?;
+    let (compact, replacement_counts) = CompactPlot::load_with_scalar_types(
         plot_file,
         &component_ids,
-        &encodings,
+        &scalar_types,
         options.non_finite_policy,
     )?;
 
     let compact_time = now.elapsed();
-    let (archive_time, serialization_time) = write_archive(plot_file.header(), compact, dest)?;
+    let (archive_time, serialization_time) =
+        write_archive(plot_file.header(), compact, &codecs, dest)?;
     let non_finite_replacements = component_ids
         .iter()
         .zip(replacement_counts)
@@ -128,6 +135,7 @@ pub unsafe fn read_compact_selected_unchecked(
 /// chunks, masks, or component values.
 pub struct CompactArchiveView<'a> {
     archive: &'a ArchivedCompactArchiveHeader,
+    bytes: &'a [u8],
 }
 
 /// Validate a compact archive and return a zero-copy view of its metadata.
@@ -139,7 +147,7 @@ pub fn view_compact(bytes: &[u8]) -> Result<CompactArchiveView<'_>> {
     let archive = rkyv::access::<ArchivedCompactArchiveHeader, Error>(header)
         .context("validating compact archive header")?;
     validate_archive_header(archive, bytes)?;
-    Ok(CompactArchiveView { archive })
+    Ok(CompactArchiveView { archive, bytes })
 }
 
 /// Return a zero-copy metadata view without validating the archived object graph.
@@ -159,7 +167,44 @@ pub unsafe fn view_compact_unchecked(bytes: &[u8]) -> Result<CompactArchiveView<
     let header = archive_header_bytes(bytes)?;
     let archive = unsafe { rkyv::access_unchecked::<ArchivedCompactArchiveHeader>(header) };
     validate_archive_header(archive, bytes)?;
-    Ok(CompactArchiveView { archive })
+    Ok(CompactArchiveView { archive, bytes })
+}
+
+/// Aggregate storage information for one chunk codec used by one component.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactChunkCodecStats {
+    /// Original plotfile component id.
+    pub component_id: usize,
+    /// Stable codec identifier stored in the archive.
+    pub codec_id: u32,
+    /// Version of this codec's metadata and payload schema.
+    pub codec_version: u16,
+    /// Number of chunks using this codec across all AMR levels.
+    pub chunk_count: usize,
+    /// Codec metadata plus aligned payload bytes, excluding chunk-directory overhead.
+    pub stored_bytes: u64,
+    /// Largest verified pointwise error recorded for these chunks.
+    pub max_abs_error: f64,
+}
+
+impl CompactChunkCodecStats {
+    /// Stable name for a built-in codec. Unknown future/private codecs return `None`.
+    pub fn codec_name(self) -> Option<&'static str> {
+        match self.codec_id {
+            chunk_codec::CODEC_UNIFORM => Some("uniform:f64"),
+            chunk_codec::CODEC_DENSE_F32 => Some("dense:f32"),
+            chunk_codec::CODEC_DENSE_F64 => Some("dense:f64"),
+            chunk_codec::CODEC_DENSE_U32 => Some("dense:u32"),
+            chunk_codec::CODEC_QUANTIZED_U8 => Some("quantized:u8"),
+            chunk_codec::CODEC_QUANTIZED_U16 => Some("quantized:u16"),
+            chunk_codec::CODEC_QUANTIZED_U32 => Some("quantized:u32"),
+            chunk_codec::CODEC_AFFINE_F64 => Some("affine:f64"),
+            chunk_codec::CODEC_AFFINE_RESIDUAL_U8 => Some("affine-residual:u8"),
+            chunk_codec::CODEC_AFFINE_RESIDUAL_U16 => Some("affine-residual:u16"),
+            chunk_codec::CODEC_AFFINE_RESIDUAL_U32 => Some("affine-residual:u32"),
+            _ => None,
+        }
+    }
 }
 
 impl CompactArchiveView<'_> {
@@ -266,7 +311,7 @@ impl CompactArchiveView<'_> {
         self.archive
             .components
             .iter()
-            .filter(|component| component.encoding == 2)
+            .filter(|component| component.scalar_type == 2)
             .map(|component| {
                 (
                     component.component_id.to_native() as usize,
@@ -276,23 +321,91 @@ impl CompactArchiveView<'_> {
             })
     }
 
-    /// Scalar encodings stored in the archive as `(component_id, encoding)`.
-    pub fn component_encodings(&self) -> impl Iterator<Item = (usize, CompactScalarEncoding)> + '_ {
+    /// Reconstructed scalar types stored as `(component_id, scalar_type)`.
+    pub fn component_scalar_types(&self) -> impl Iterator<Item = (usize, CompactScalarType)> + '_ {
         self.archive.components.iter().map(|component| {
             let id = component.component_id.to_native() as usize;
-            let encoding = archived_encoding(
-                component.encoding,
+            let scalar_type = archived_scalar_type(
+                component.scalar_type,
                 component.min.to_native(),
                 component.max.to_native(),
             )
-            .expect("compact archive encoding was validated");
-            (id, encoding)
+            .expect("compact archive scalar type was validated");
+            (id, scalar_type)
         })
     }
 
     /// Number of AMR levels stored in this archive.
     pub fn level_count(&self) -> usize {
         self.archive.levels.len()
+    }
+
+    /// Inspect adaptive chunk codecs without decoding their scalar values.
+    pub fn chunk_codec_stats(&self) -> Result<Vec<CompactChunkCodecStats>> {
+        let header_start =
+            self.bytes.len() - FOOTER_LENGTH as usize - archive_header_bytes(self.bytes)?.len();
+        let mut stats = Vec::<CompactChunkCodecStats>::new();
+        for level in self.archive.levels.iter() {
+            for (slot, component) in level.components.iter().enumerate() {
+                let offset = component.data.offset.to_native();
+                let length = component.data.stored_length.to_native();
+                let start = usize::try_from(offset).context("component offset exceeds usize")?;
+                let end = start
+                    .checked_add(usize::try_from(length).context("component length exceeds usize")?)
+                    .context("component extent overflow")?;
+                ensure!(end <= header_start, "component block is out of bounds");
+                let grid =
+                    rkyv::access::<ArchivedArchiveScalarGrid, Error>(&self.bytes[start..end])
+                        .context("validating adaptive chunk directory")?;
+                let component_id = self.archive.components[slot].component_id.to_native() as usize;
+                for chunk in grid.chunks.iter() {
+                    let payload_length = chunk.payload_length.to_native();
+                    ensure!(
+                        u64::try_from(chunk.payload.len()).ok() == Some(payload_length.div_ceil(8)),
+                        "invalid aligned chunk payload length"
+                    );
+                    let metadata_bytes = u64::try_from(chunk.metadata.len())
+                        .context("chunk metadata size exceeds u64")?;
+                    let payload_bytes = u64::try_from(chunk.payload.len())
+                        .context("chunk payload size exceeds u64")?
+                        .checked_mul(8)
+                        .context("chunk payload size overflow")?;
+                    let stored_bytes = metadata_bytes
+                        .checked_add(payload_bytes)
+                        .context("chunk storage size overflow")?;
+                    let codec_id = chunk.codec_id.to_native();
+                    let codec_version = chunk.codec_version.to_native();
+                    let max_abs_error = chunk.max_abs_error.to_native();
+                    ensure!(
+                        max_abs_error.is_finite() && max_abs_error >= 0.0,
+                        "invalid chunk error bound"
+                    );
+                    if let Some(existing) = stats.iter_mut().find(|entry| {
+                        entry.component_id == component_id
+                            && entry.codec_id == codec_id
+                            && entry.codec_version == codec_version
+                    }) {
+                        existing.chunk_count += 1;
+                        existing.stored_bytes = existing
+                            .stored_bytes
+                            .checked_add(stored_bytes)
+                            .context("codec storage size overflow")?;
+                        existing.max_abs_error = existing.max_abs_error.max(max_abs_error);
+                    } else {
+                        stats.push(CompactChunkCodecStats {
+                            component_id,
+                            codec_id,
+                            codec_version,
+                            chunk_count: 1,
+                            stored_bytes,
+                            max_abs_error,
+                        });
+                    }
+                }
+            }
+        }
+        stats.sort_by_key(|entry| (entry.component_id, entry.codec_id, entry.codec_version));
+        Ok(stats)
     }
 }
 
@@ -307,8 +420,8 @@ fn validate_archive_header(archive: &ArchivedCompactArchiveHeader, bytes: &[u8])
         archive.header.coordinate_system
     );
     for (index, component) in archive.components.iter().enumerate() {
-        archived_encoding(
-            component.encoding,
+        archived_scalar_type(
+            component.scalar_type,
             component.min.to_native(),
             component.max.to_native(),
         )?;
@@ -351,6 +464,7 @@ fn validate_archive_header(archive: &ArchivedCompactArchiveHeader, bytes: &[u8])
                 let max = range.max.map(|value| value.to_native());
                 let value_min = range.value_min.to_native();
                 let value_max = range.value_max.to_native();
+                let max_abs_error = range.max_abs_error.to_native();
                 ensure!(
                     min.iter().zip(max).all(|(&min, max)| min <= max),
                     "compact chunk range has invalid bounds"
@@ -358,6 +472,10 @@ fn validate_archive_header(archive: &ArchivedCompactArchiveHeader, bytes: &[u8])
                 ensure!(
                     value_min.is_finite() && value_max.is_finite() && value_min <= value_max,
                     "compact chunk range has invalid scalar bounds"
+                );
+                ensure!(
+                    max_abs_error.is_finite() && max_abs_error >= 0.0,
+                    "compact chunk range has invalid error bound"
                 );
             }
         }
@@ -405,7 +523,7 @@ pub struct CompactPlot {
     pub(crate) variable_count: usize,
     pub(crate) refinement_ratios: Vec<usize>,
     pub(crate) component_ids: Vec<usize>,
-    pub(crate) encodings: Vec<CompactScalarEncoding>,
+    pub(crate) scalar_types: Vec<CompactScalarType>,
     pub(crate) levels: Vec<CompactLevel>,
 }
 
@@ -461,23 +579,24 @@ impl CompactPlot {
     /// `component_ids` are plotfile variable indices. At least one component is
     /// required because the first component defines active dual cubes.
     pub fn load(plot_file: &PlotFile, component_ids: &[usize]) -> Result<Self> {
-        let encodings = vec![CompactScalarEncoding::F32; component_ids.len()];
-        Self::load_with_encodings(
+        let scalar_types = vec![CompactScalarType::F32; component_ids.len()];
+        Self::load_with_scalar_types(
             plot_file,
             component_ids,
-            &encodings,
+            &scalar_types,
             NonFinitePolicy::ReplaceWithZero,
         )
         .map(|(plot, _)| plot)
     }
 
-    fn load_with_encodings(
+    fn load_with_scalar_types(
         plot_file: &PlotFile,
         component_ids: &[usize],
-        encodings: &[CompactScalarEncoding],
+        scalar_types: &[CompactScalarType],
         non_finite_policy: NonFinitePolicy,
     ) -> Result<(Self, Vec<usize>)> {
-        let sparse_amr = SparseAmr::load(plot_file, component_ids, encodings, non_finite_policy)?;
+        let sparse_amr =
+            SparseAmr::load(plot_file, component_ids, scalar_types, non_finite_policy)?;
         ensure!(
             sparse_amr.component_ids == component_ids,
             "sparse AMR component order changed while loading"
@@ -535,7 +654,7 @@ impl CompactPlot {
                 variable_count: plot_file.variables().len(),
                 refinement_ratios: plot_file.header().refinement_ratios.clone(),
                 component_ids: component_ids.to_vec(),
-                encodings: encodings.to_vec(),
+                scalar_types: scalar_types.to_vec(),
                 levels,
             },
             non_finite_replacements,
@@ -564,16 +683,16 @@ impl CompactPlot {
 
     /// Return the original normalization bounds for a stored component.
     pub fn component_normalization(&self, component_id: usize) -> Option<(f64, f64)> {
-        match self.component_encoding(component_id)? {
-            CompactScalarEncoding::UNorm32 { min, max } => Some((min, max)),
-            CompactScalarEncoding::F32 | CompactScalarEncoding::F64 => None,
+        match self.component_scalar_type(component_id)? {
+            CompactScalarType::UNorm32 { min, max } => Some((min, max)),
+            CompactScalarType::F32 | CompactScalarType::F64 => None,
         }
     }
 
     /// Scalar representation used for a stored component.
-    pub fn component_encoding(&self, component_id: usize) -> Option<CompactScalarEncoding> {
+    pub fn component_scalar_type(&self, component_id: usize) -> Option<CompactScalarType> {
         self.component_slot(component_id)
-            .and_then(|slot| self.encodings.get(slot).copied())
+            .and_then(|slot| self.scalar_types.get(slot).copied())
     }
 
     /// Number of AMR levels stored in this compact plot.
@@ -606,6 +725,7 @@ impl CompactPlot {
 fn write_archive(
     source_header: &Header,
     compact: CompactPlot,
+    codecs: &[CompactComponentCodec],
     dest: &mut impl Write,
 ) -> Result<(Duration, Duration)> {
     let mut archive_time = Duration::ZERO;
@@ -617,11 +737,15 @@ fn write_archive(
     let mut offset = PREFIX_LENGTH;
 
     let CompactPlot {
-        encodings,
+        scalar_types,
         component_ids,
         levels,
         ..
     } = compact;
+    ensure!(
+        codecs.len() == component_ids.len(),
+        "compact component codec metadata mismatch"
+    );
     let mut archive_levels = Vec::with_capacity(levels.len());
 
     for level in levels {
@@ -631,11 +755,13 @@ fn write_archive(
             "compact level component metadata mismatch"
         );
         let mut component_blocks = Vec::with_capacity(level.components.len());
-        for (component, ranges) in level.components.iter().zip(&level.value_ranges) {
+        for ((component, ranges), &codec) in
+            level.components.iter().zip(&level.value_ranges).zip(codecs)
+        {
             let bytes = match component {
                 CompactScalarGrid::F32(grid) => {
                     let start = Instant::now();
-                    let grid = archive_scalar_grid(grid);
+                    let grid = chunk_codec::encode_f32(grid, codec)?;
                     archive_time += start.elapsed();
                     let start = Instant::now();
                     let bytes = rkyv::to_bytes::<Error>(&grid)
@@ -645,7 +771,7 @@ fn write_archive(
                 }
                 CompactScalarGrid::F64(grid) => {
                     let start = Instant::now();
-                    let grid = archive_scalar_grid(grid);
+                    let grid = chunk_codec::encode_f64(grid, codec)?;
                     archive_time += start.elapsed();
                     let start = Instant::now();
                     let bytes = rkyv::to_bytes::<Error>(&grid)
@@ -655,7 +781,7 @@ fn write_archive(
                 }
                 CompactScalarGrid::UNorm32 { values, .. } => {
                     let start = Instant::now();
-                    let grid = archive_scalar_grid(values);
+                    let grid = chunk_codec::encode_unorm32(values, codec)?;
                     archive_time += start.elapsed();
                     let start = Instant::now();
                     let bytes = rkyv::to_bytes::<Error>(&grid)
@@ -677,6 +803,7 @@ fn write_archive(
                         max: uvec3_to_array(range.aabb.max),
                         value_min: range.min,
                         value_max: range.max,
+                        max_abs_error: codec.max_abs_error.unwrap_or(0.0),
                     })
                     .collect(),
             });
@@ -708,13 +835,13 @@ fn write_archive(
     let archive_start = Instant::now();
     let components = component_ids
         .into_iter()
-        .zip(encodings)
-        .map(|(component_id, encoding)| {
-            let (encoding, min, max) = encoding_fields(encoding);
+        .zip(scalar_types)
+        .map(|(component_id, scalar_type)| {
+            let (scalar_type, min, max) = scalar_type_fields(scalar_type);
             Ok(ArchiveStoredComponent {
                 component_id: u32::try_from(component_id)
                     .context("component id does not fit in u32")?,
-                encoding,
+                scalar_type,
                 min,
                 max,
             })
@@ -838,11 +965,11 @@ fn read_compact_impl(bytes: &[u8], requested: Option<&[u32]>) -> Result<CompactP
                 .with_context(|| format!("component index {id} is not stored in archive"))?,
         );
     }
-    let encodings = selected_slots
+    let scalar_types = selected_slots
         .iter()
         .map(|&slot| {
             let component = &archive.components[slot];
-            archived_encoding(component.encoding, component.min, component.max)
+            archived_scalar_type(component.scalar_type, component.min, component.max)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -856,9 +983,9 @@ fn read_compact_impl(bytes: &[u8], requested: Option<&[u32]>) -> Result<CompactP
             );
             let components = selected_slots
                 .iter()
-                .zip(&encodings)
-                .map(|(&slot, &encoding)| {
-                    read_scalar_block(bytes, &level.components[slot].data, encoding)
+                .zip(&scalar_types)
+                .map(|(&slot, &scalar_type)| {
+                    read_scalar_block(bytes, &level.components[slot].data, scalar_type)
                 })
                 .collect::<Result<Vec<_>>>()?;
             let value_ranges = selected_slots
@@ -869,8 +996,8 @@ fn read_compact_impl(bytes: &[u8], requested: Option<&[u32]>) -> Result<CompactP
                         .iter()
                         .map(|range| ChunkValueRange {
                             aabb: Aabb3u::new(array_to_uvec3(range.min), array_to_uvec3(range.max)),
-                            min: range.value_min,
-                            max: range.value_max,
+                            min: (range.value_min - range.max_abs_error).max(-f64::MAX),
+                            max: (range.value_max + range.max_abs_error).min(f64::MAX),
                         })
                         .collect()
                 })
@@ -903,7 +1030,7 @@ fn read_compact_impl(bytes: &[u8], requested: Option<&[u32]>) -> Result<CompactP
             .map(|&ratio| usize::try_from(ratio).context("refinement ratio does not fit in usize"))
             .collect::<Result<Vec<_>>>()?,
         component_ids: requested_ids,
-        encodings,
+        scalar_types,
         levels,
     })
 }
@@ -935,24 +1062,21 @@ fn block_slice<'a>(bytes: &'a [u8], block: &ArchiveBlock) -> Result<&'a [u8]> {
 fn read_scalar_block(
     bytes: &[u8],
     block: &ArchiveBlock,
-    encoding: CompactScalarEncoding,
+    scalar_type: CompactScalarType,
 ) -> Result<CompactScalarGrid> {
     let block = block_slice(bytes, block)?;
-    match encoding {
-        CompactScalarEncoding::F32 => Ok(CompactScalarGrid::F32(
-            rkyv::from_bytes::<ArchiveScalarGrid<f32>, Error>(block)
-                .context("reading f32 compact component")?
-                .into_grid()?,
+    let archive = rkyv::from_bytes::<ArchiveScalarGrid, Error>(block)
+        .context("reading adaptive compact scalar grid")?;
+    match scalar_type {
+        CompactScalarType::F32 => Ok(CompactScalarGrid::F32(
+            chunk_codec::decode_f32(archive).context("decoding f32 compact component")?,
         )),
-        CompactScalarEncoding::F64 => Ok(CompactScalarGrid::F64(
-            rkyv::from_bytes::<ArchiveScalarGrid<f64>, Error>(block)
-                .context("reading f64 compact component")?
-                .into_grid()?,
+        CompactScalarType::F64 => Ok(CompactScalarGrid::F64(
+            chunk_codec::decode_f64(archive).context("decoding f64 compact component")?,
         )),
-        CompactScalarEncoding::UNorm32 { min, max } => Ok(CompactScalarGrid::UNorm32 {
-            values: rkyv::from_bytes::<ArchiveScalarGrid<u32>, Error>(block)
-                .context("reading UNorm32 compact component")?
-                .into_grid()?,
+        CompactScalarType::UNorm32 { min, max } => Ok(CompactScalarGrid::UNorm32 {
+            values: chunk_codec::decode_unorm32(archive)
+                .context("decoding UNorm32 compact component")?,
             min,
             max,
         }),
@@ -985,30 +1109,109 @@ fn selected_component_ids(plot_file: &PlotFile, options: &CompactOptions) -> Res
     Ok(component_ids)
 }
 
-fn selected_encodings(
+fn selected_scalar_types(
     component_ids: &[usize],
     options: &CompactOptions,
-) -> Result<Vec<CompactScalarEncoding>> {
-    let mut result = vec![CompactScalarEncoding::F32; component_ids.len()];
+) -> Result<Vec<CompactScalarType>> {
+    let mut result = vec![CompactScalarType::F32; component_ids.len()];
     let mut assigned = vec![false; component_ids.len()];
-    for requested in &options.encodings {
-        requested.encoding.validate()?;
+    for requested in &options.scalar_types {
+        requested.scalar_type.validate()?;
         let component_id = usize::try_from(requested.component_id)
-            .context("encoding component id does not fit in usize")?;
+            .context("scalar-type component id does not fit in usize")?;
         let slot = component_ids
             .iter()
             .position(|&id| id == component_id)
             .with_context(|| {
-                format!("encoding component {component_id} is not selected for compaction")
+                format!("scalar-type component {component_id} is not selected for compaction")
             })?;
         ensure!(
             !assigned[slot],
-            "component {component_id} has multiple encoding overrides"
+            "component {component_id} has multiple scalar-type overrides"
         );
         assigned[slot] = true;
-        result[slot] = requested.encoding;
+        result[slot] = requested.scalar_type;
     }
     Ok(result)
+}
+
+fn selected_codecs(
+    component_ids: &[usize],
+    scalar_types: &[CompactScalarType],
+    options: &CompactOptions,
+) -> Result<Vec<CompactComponentCodec>> {
+    ensure!(
+        component_ids.len() == scalar_types.len(),
+        "component scalar-type count mismatch"
+    );
+    let mut result = component_ids
+        .iter()
+        .map(|&component_id| CompactComponentCodec {
+            component_id: component_id as u32,
+            selection: CompactChunkCodecSelection::AutoLossless,
+            max_abs_error: None,
+        })
+        .collect::<Vec<_>>();
+    let mut assigned = vec![false; component_ids.len()];
+    for &requested in &options.codecs {
+        if let Some(error) = requested.max_abs_error {
+            ensure!(
+                error.is_finite() && error >= 0.0,
+                "maximum absolute chunk error must be finite and non-negative"
+            );
+        }
+        let component_id = usize::try_from(requested.component_id)
+            .context("codec component id does not fit in usize")?;
+        let slot = component_ids
+            .iter()
+            .position(|&id| id == component_id)
+            .with_context(|| {
+                format!("codec component {component_id} is not selected for compaction")
+            })?;
+        ensure!(
+            !assigned[slot],
+            "component {component_id} has multiple codec policies"
+        );
+        assigned[slot] = true;
+        validate_codec_policy(scalar_types[slot], requested)?;
+        result[slot] = requested;
+    }
+    Ok(result)
+}
+
+fn validate_codec_policy(
+    scalar_type: CompactScalarType,
+    policy: CompactComponentCodec,
+) -> Result<()> {
+    let requires_error = match policy.selection {
+        CompactChunkCodecSelection::AutoLossless => false,
+        CompactChunkCodecSelection::AutoSmallest => true,
+        CompactChunkCodecSelection::Forced(codec) => match codec {
+            CompactChunkCodec::DenseF32 if scalar_type == CompactScalarType::F32 => false,
+            CompactChunkCodec::DenseF64 if scalar_type == CompactScalarType::F64 => false,
+            CompactChunkCodec::DenseU32
+                if matches!(scalar_type, CompactScalarType::UNorm32 { .. }) =>
+            {
+                false
+            }
+            CompactChunkCodec::DenseF64 | CompactChunkCodec::DenseU32 => {
+                anyhow::bail!(
+                    "codec {} is incompatible with scalar type {scalar_type:?}",
+                    chunk_codec::codec_name(codec)
+                )
+            }
+            _ => true,
+        },
+    };
+    ensure!(
+        policy.max_abs_error.is_some() == requires_error,
+        if requires_error {
+            "lossy codec policy requires max_abs_error"
+        } else {
+            "lossless codec policy does not accept max_abs_error"
+        }
+    );
+    Ok(())
 }
 
 fn build_active_dual_cubes_for_scalar(
@@ -1151,9 +1354,9 @@ mod tests {
                 &plotfile,
                 CompactOptions {
                     component_ids: vec![0],
-                    encodings: vec![CompactComponentEncoding {
+                    scalar_types: vec![CompactComponentScalarType {
                         component_id: 0,
-                        encoding: CompactScalarEncoding::UNorm32 { min, max },
+                        scalar_type: CompactScalarType::UNorm32 { min, max },
                     }],
                     ..CompactOptions::default()
                 },
@@ -1203,9 +1406,9 @@ mod tests {
                 &plotfile,
                 CompactOptions {
                     component_ids: vec![0],
-                    encodings: vec![CompactComponentEncoding {
+                    scalar_types: vec![CompactComponentScalarType {
                         component_id: 0,
-                        encoding: CompactScalarEncoding::F64,
+                        scalar_type: CompactScalarType::F64,
                     }],
                     ..CompactOptions::default()
                 },
@@ -1214,8 +1417,8 @@ mod tests {
 
             let compact = read_compact(&bytes)?;
             ensure!(
-                compact.component_encoding(0) == Some(CompactScalarEncoding::F64),
-                "f64 encoding metadata was not preserved"
+                compact.component_scalar_type(0) == Some(CompactScalarType::F64),
+                "f64 scalar-type metadata was not preserved"
             );
             let stats = compact.component_stats(0).context("missing component")?;
             ensure!(stats.min == Some(base), "f64 minimum lost precision");
@@ -1234,6 +1437,61 @@ mod tests {
             ensure!(
                 !mesh.indices.is_empty(),
                 "f64 detail did not produce a surface"
+            );
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&root);
+        result
+    }
+
+    #[test]
+    fn adaptive_archive_reports_codec_and_respects_error() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "amrex_rs_compact_adaptive_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = [0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+        write_single_cube_plotfile_values(&root, source)?;
+
+        let result = (|| -> Result<()> {
+            let plotfile = PlotFile::open(&root)?;
+            let mut bytes = Vec::new();
+            write_compact(
+                &plotfile,
+                CompactOptions {
+                    component_ids: vec![0],
+                    scalar_types: vec![CompactComponentScalarType {
+                        component_id: 0,
+                        scalar_type: CompactScalarType::F64,
+                    }],
+                    codecs: vec![CompactComponentCodec {
+                        component_id: 0,
+                        selection: CompactChunkCodecSelection::AutoSmallest,
+                        max_abs_error: Some(0.5),
+                    }],
+                    ..CompactOptions::default()
+                },
+                &mut bytes,
+            )?;
+
+            let view = view_compact(&bytes)?;
+            let codecs = view.chunk_codec_stats()?;
+            ensure!(codecs.len() == 1, "unexpected adaptive codec count");
+            ensure!(
+                codecs[0].codec_id == chunk_codec::CODEC_UNIFORM,
+                "expected approximate uniform chunk"
+            );
+            ensure!(codecs[0].max_abs_error <= 0.5);
+
+            let compact = read_compact(&bytes)?;
+            let stats = compact.component_stats(0).context("missing component")?;
+            ensure!(stats.min == Some(0.5) && stats.max == Some(0.5));
+            let range = compact.levels[0].value_ranges[0][0];
+            ensure!(
+                range.min <= -0.5 && range.max >= 1.5,
+                "isosurface range was not expanded by the error budget"
             );
             Ok(())
         })();
@@ -1284,9 +1542,9 @@ mod tests {
                 &plotfile,
                 CompactOptions {
                     component_ids: vec![0],
-                    encodings: vec![CompactComponentEncoding {
+                    scalar_types: vec![CompactComponentScalarType {
                         component_id: 0,
-                        encoding: CompactScalarEncoding::F64,
+                        scalar_type: CompactScalarType::F64,
                     }],
                     ..CompactOptions::default()
                 },

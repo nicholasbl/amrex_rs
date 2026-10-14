@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use glam::{DVec3, I64Vec3, IVec3, UVec3};
 
 use crate::compact::scalar::CompactScalarGrid;
-use crate::compact::{CompactScalarEncoding, NonFinitePolicy};
+use crate::compact::{CompactScalarType, NonFinitePolicy};
 use crate::utility::Aabb3u;
 use crate::{DataReader, IndexDomain, Level, Patch, PlotFile};
 
@@ -31,12 +31,12 @@ impl SparseAmr {
     pub(crate) fn load(
         plot_file: &PlotFile,
         component_ids: &[usize],
-        encodings: &[CompactScalarEncoding],
+        scalar_types: &[CompactScalarType],
         non_finite_policy: NonFinitePolicy,
     ) -> Result<Self> {
         ensure!(
-            component_ids.len() == encodings.len(),
-            "component and encoding counts differ"
+            component_ids.len() == scalar_types.len(),
+            "component and scalar-type counts differ"
         );
         for &component in component_ids {
             ensure!(
@@ -54,7 +54,7 @@ impl SparseAmr {
                     level,
                     plot_file.header().domain.min,
                     component_ids,
-                    encodings,
+                    scalar_types,
                     non_finite_policy,
                 )
                 .with_context(|| format!("loading sparse AMR level {}", level.index()))
@@ -84,14 +84,14 @@ fn load_level(
     level: Level<'_>,
     physical_origin: DVec3,
     component_ids: &[usize],
-    encodings: &[CompactScalarEncoding],
+    scalar_types: &[CompactScalarType],
     non_finite_policy: NonFinitePolicy,
 ) -> Result<SparseAmrLevel> {
     let domain = level.index_domain();
     let bounds = index_extent(domain)?;
-    let mut components = encodings
+    let mut components = scalar_types
         .iter()
-        .map(|&encoding| CompactScalarGrid::new(bounds, level.patch_count(), encoding))
+        .map(|&scalar_type| CompactScalarGrid::new(bounds, level.patch_count(), scalar_type))
         .collect::<Vec<_>>();
     let mut non_finite_replacements = vec![0; component_ids.len()];
     let mut valid_regions = Vec::with_capacity(level.patch_count());

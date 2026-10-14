@@ -1,12 +1,12 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use rkyv::{Archive, Deserialize, Serialize};
 
-use super::CompactScalarEncoding;
+use super::CompactScalarType;
 use crate::utility::{SparseGrid3, SparseGridChunkView};
 use crate::{BoundingBox, CoordinateSystem, Header, IndexDomain, Variable};
 
 pub(super) const FORMAT_MAGIC: u32 = u32::from_le_bytes(*b"AMRC");
-pub(super) const FORMAT_VERSION: u32 = 3;
+pub(super) const FORMAT_VERSION: u32 = 5;
 pub(super) const PREFIX_LENGTH: u64 = 8;
 pub(super) const FOOTER_LENGTH: u64 = 8;
 
@@ -21,7 +21,7 @@ pub(super) struct CompactArchiveHeader {
 #[derive(Archive, Deserialize, Serialize)]
 pub(super) struct ArchiveStoredComponent {
     pub(super) component_id: u32,
-    pub(super) encoding: u8,
+    pub(super) scalar_type: u8,
     pub(super) min: f64,
     pub(super) max: f64,
 }
@@ -95,26 +95,38 @@ pub(super) struct ArchiveChunkRange {
     pub(super) max: [u32; 3],
     pub(super) value_min: f64,
     pub(super) value_max: f64,
+    /// Conservative error used when deciding whether a decoded chunk can
+    /// intersect an isovalue.
+    pub(super) max_abs_error: f64,
+}
+
+/// A scalar grid whose chunks carry independently versioned codec payloads.
+///
+/// Codec ids deliberately are integers rather than an archived enum. Readers
+/// can validate and inspect a directory containing an unknown future codec,
+/// then report it only if decoding that chunk is requested.
+#[derive(Archive, Deserialize, Serialize)]
+pub(super) struct ArchiveScalarGrid {
+    pub(super) bounds: [u32; 3],
+    pub(super) decoded_type: u8,
+    pub(super) chunks: Vec<ArchiveScalarChunk>,
 }
 
 #[derive(Archive, Deserialize, Serialize)]
-pub(super) struct ArchiveScalarGrid<T> {
-    bounds: [u32; 3],
-    chunks: Vec<ArchiveScalarChunk<T>>,
-}
-
-#[derive(Archive, Deserialize, Serialize)]
-enum ArchiveScalarChunk<T> {
-    Uniform {
-        key: [u32; 3],
-        value: T,
-        mask: Box<[u64; crate::utility::MASK_WORDS]>,
-    },
-    Dense {
-        key: [u32; 3],
-        values: Vec<T>,
-        mask: Box<[u64; crate::utility::MASK_WORDS]>,
-    },
+pub(super) struct ArchiveScalarChunk {
+    pub(super) key: [u32; 3],
+    pub(super) mask: Box<[u64; crate::utility::MASK_WORDS]>,
+    pub(super) codec_id: u32,
+    pub(super) codec_version: u16,
+    pub(super) codec_flags: u16,
+    pub(super) max_abs_error: f64,
+    /// Codec-specific, versioned metadata. This is opaque to the container.
+    pub(super) metadata: Vec<u8>,
+    /// Unpadded payload length. Payload words keep content 8-byte aligned.
+    pub(super) payload_length: u64,
+    /// Length-delimited codec payload packed into little-endian words. Empty
+    /// payloads are valid.
+    pub(super) payload: Vec<u64>,
 }
 
 #[derive(Archive, Deserialize, Serialize)]
@@ -129,23 +141,23 @@ struct ArchiveMaskChunk {
     mask: Box<[u64; crate::utility::MASK_WORDS]>,
 }
 
-pub(super) fn encoding_fields(encoding: CompactScalarEncoding) -> (u8, f64, f64) {
-    match encoding {
-        CompactScalarEncoding::F32 => (0, 0.0, 0.0),
-        CompactScalarEncoding::F64 => (1, 0.0, 0.0),
-        CompactScalarEncoding::UNorm32 { min, max } => (2, min, max),
+pub(super) fn scalar_type_fields(scalar_type: CompactScalarType) -> (u8, f64, f64) {
+    match scalar_type {
+        CompactScalarType::F32 => (0, 0.0, 0.0),
+        CompactScalarType::F64 => (1, 0.0, 0.0),
+        CompactScalarType::UNorm32 { min, max } => (2, min, max),
     }
 }
 
-pub(super) fn archived_encoding(tag: u8, min: f64, max: f64) -> Result<CompactScalarEncoding> {
-    let encoding = match tag {
-        0 => CompactScalarEncoding::F32,
-        1 => CompactScalarEncoding::F64,
-        2 => CompactScalarEncoding::UNorm32 { min, max },
-        _ => anyhow::bail!("unsupported compact scalar encoding {tag}"),
+pub(super) fn archived_scalar_type(tag: u8, min: f64, max: f64) -> Result<CompactScalarType> {
+    let scalar_type = match tag {
+        0 => CompactScalarType::F32,
+        1 => CompactScalarType::F64,
+        2 => CompactScalarType::UNorm32 { min, max },
+        _ => anyhow::bail!("unsupported compact scalar type {tag}"),
     };
-    encoding.validate()?;
-    Ok(encoding)
+    scalar_type.validate()?;
+    Ok(scalar_type)
 }
 
 impl ArchiveHeader {
@@ -217,69 +229,6 @@ impl ArchiveIndexDomain {
             min: ivec3_to_array(domain.min),
             max: ivec3_to_array(domain.max),
             index_type: ivec3_to_array(domain.index_type),
-        }
-    }
-}
-
-pub(super) fn archive_scalar_grid<T>(grid: &SparseGrid3<T>) -> ArchiveScalarGrid<T>
-where
-    T: Copy + PartialEq,
-{
-    let mut chunks = Vec::with_capacity(grid.chunk_count());
-    grid.for_each_chunk(|chunk| match chunk {
-        SparseGridChunkView::Uniform { key, value, mask } => {
-            chunks.push(ArchiveScalarChunk::Uniform {
-                key: uvec3_to_array(key),
-                value,
-                mask: Box::new(mask),
-            });
-        }
-        SparseGridChunkView::Dense { key, values, mask } => {
-            chunks.push(ArchiveScalarChunk::Dense {
-                key: uvec3_to_array(key),
-                values: values.to_vec(),
-                mask: Box::new(mask),
-            });
-        }
-    });
-    chunks.sort_by_key(ArchiveScalarChunk::key);
-    ArchiveScalarGrid {
-        bounds: uvec3_to_array(grid.bounds()),
-        chunks,
-    }
-}
-
-impl<T> ArchiveScalarGrid<T>
-where
-    T: Copy + PartialEq,
-{
-    pub(super) fn into_grid(self) -> Result<SparseGrid3<T>> {
-        let mut grid =
-            SparseGrid3::with_chunk_capacity(array_to_uvec3(self.bounds), self.chunks.len());
-        for chunk in self.chunks {
-            match chunk {
-                ArchiveScalarChunk::Uniform { key, value, mask } => {
-                    grid.insert_uniform_chunk(array_to_uvec3(key), value, *mask);
-                }
-                ArchiveScalarChunk::Dense { key, values, mask } => {
-                    ensure!(
-                        values.len() == crate::utility::CHUNK_VOLUME,
-                        "dense chunk has {} values; expected {}",
-                        values.len(),
-                        crate::utility::CHUNK_VOLUME
-                    );
-                    grid.insert_dense_chunk(array_to_uvec3(key), values.into_boxed_slice(), *mask);
-                }
-            }
-        }
-        Ok(grid)
-    }
-}
-
-impl<T> ArchiveScalarChunk<T> {
-    fn key(&self) -> [u32; 3] {
-        match self {
-            Self::Uniform { key, .. } | Self::Dense { key, .. } => *key,
         }
     }
 }

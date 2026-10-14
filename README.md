@@ -243,19 +243,44 @@ An empty `component_ids` list selects all variables. Otherwise, component IDs ar
 the zero-based indices exposed by `PlotFile::variables()`.
 
 For per-variable storage, pass a reusable TOML configuration to `pltcompact`.
-Quantities default to `f32`; `f64` retains genuine double precision, while
-`unorm32` maps one global physical range to all 32 bits of an unsigned integer:
+`scalar_type` controls the values reconstructed by the reader. Quantities
+default to `f32`; `f64` retains genuine double precision, while `unorm32` maps
+one global physical range to all 32 bits of an unsigned integer:
 
 ```toml
 [[variables]]
 name = "density"
-encoding = "unorm32"
+scalar_type = "unorm32"
+codec = "auto:smallest"
 normalize = [1.0e20, 1.000000001e20]
+max_abs_error = 1.0e-6
 
 [[variables]]
 name = "temperature"
-encoding = "f64"
+scalar_type = "f64"
+codec = "quantized:u16"
+max_abs_error = 1.0e-4
 ```
+
+`codec` controls the on-disk representation independently of `scalar_type`.
+Every codec name uses `family:value` syntax. Automatic policies are
+`auto:lossless` and `auto:smallest`. The latter selects the smallest supported
+codec that meets `max_abs_error`. Concrete codecs force every non-uniform chunk
+to use that codec: `dense:f32`, `dense:f64`, `dense:u32`, `uniform:f64`,
+`quantized:u8`, `quantized:u16`, `quantized:u32`, `affine:f64`, and
+`affine-residual:u8`, `affine-residual:u16`, or `affine-residual:u32`.
+Structurally uniform sparse chunks always retain the exact `uniform:f64`
+representation.
+
+Lossy policies require `max_abs_error`; exact native dense codecs and
+`auto:lossless` reject it. The tolerance is measured after decoding in the
+reconstructed scalar domain, so it is in `[0, 1]` units for `unorm32`
+quantities. Omitting `codec` uses `auto:lossless`.
+
+Chunk codecs have independent numeric ids and versions in the archive. Their
+metadata and payloads are length-delimited, allowing future codecs to be added
+without changing the container format. `probe` reports the codec mix, payload
+sizes, and maximum observed error bound without decoding scalar values.
 
 ```sh
 cargo run --release --bin pltcompact -- \
@@ -267,8 +292,8 @@ This lets the same variable recipe be reused across a collection of plotfiles.
 `--config compact.toml` form used. When command-line paths are supplied, they
 override the paths from the TOML.
 
-For backward-compatible configs, `normalize` without an explicit `encoding`
-implies `unorm32`. Quantization is performed in `f64` as
+For convenience, `normalize` without an explicit `scalar_type` implies
+`unorm32`. Global normalization is performed in `f64` as
 `round(clamp((value - min) / (max - min), 0, 1) * u32::MAX)`. The original
 bounds are retained in archive metadata and shown by `probe`. Isovalues for
 normalized quantities must likewise be in the normalized `[0, 1]` range.
@@ -288,5 +313,5 @@ before MC33 visits individual cubes. Scalar calculations remain in `f64`; final
 mesh positions and UVs are stored as `f32` for graphics use.
 
 The compact archive format is intended for use by this crate and may change before a stable 1.0 release.
-The current offset-based format is version 3. Earlier archives must be
+The current offset-based format is version 5. Earlier archives must be
 regenerated with the current `pltcompact`.

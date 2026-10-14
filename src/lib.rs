@@ -16,8 +16,9 @@ pub mod utility;
 #[allow(deprecated)]
 pub use compact::read_compact_selected_unchecked;
 pub use compact::{
-    CompactArchiveView, CompactComponentEncoding, CompactComponentStats, CompactOptions,
-    CompactPlot, CompactScalarEncoding, NonFinitePolicy, NonFiniteReplacement, read_compact,
+    CompactArchiveView, CompactChunkCodec, CompactChunkCodecSelection, CompactChunkCodecStats,
+    CompactComponentCodec, CompactComponentScalarType, CompactComponentStats, CompactOptions,
+    CompactPlot, CompactScalarType, NonFinitePolicy, NonFiniteReplacement, read_compact,
     read_compact_selected, view_compact, view_compact_unchecked, write_compact,
 };
 pub use decimate::{

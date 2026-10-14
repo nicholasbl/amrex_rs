@@ -566,7 +566,7 @@ fn flip_winding(faces: &mut [[u32; 3]]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{CompactLevel, CompactPlot, CompactScalarEncoding, CompactScalarGrid};
+    use crate::compact::{CompactLevel, CompactPlot, CompactScalarGrid, CompactScalarType};
     use crate::utility::SparseGrid3;
     use glam::{IVec3, Vec3};
 
@@ -589,7 +589,7 @@ mod tests {
             variable_count: 2,
             refinement_ratios: Vec::new(),
             component_ids: vec![0, 1],
-            encodings: vec![CompactScalarEncoding::F32; 2],
+            scalar_types: vec![CompactScalarType::F32; 2],
             levels: vec![CompactLevel {
                 level_index: 0,
                 index_origin: IVec3::ZERO,
@@ -611,7 +611,7 @@ mod tests {
             variable_count: 1,
             refinement_ratios: Vec::new(),
             component_ids: vec![0],
-            encodings: vec![CompactScalarEncoding::F32],
+            scalar_types: vec![CompactScalarType::F32],
             levels: vec![CompactLevel {
                 level_index: 0,
                 index_origin: IVec3::ZERO,
