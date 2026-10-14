@@ -11,7 +11,7 @@ fn usage(program: &str) -> String {
 
 fn parse_args() -> Result<Option<PathBuf>> {
     let mut args = env::args();
-    let program = args.next().unwrap_or_else(|| "probe".to_string());
+    let program = args.next().unwrap_or_else(|| "amr-probe".to_string());
     let values = args.collect::<Vec<_>>();
 
     if values

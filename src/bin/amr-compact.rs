@@ -203,7 +203,7 @@ fn parse_codec(value: &str) -> Result<CompactChunkCodecSelection> {
 
 impl Args {
     fn parse() -> Result<Self> {
-        const USAGE: &str = "usage:\n  pltcompact <variable1> <variable2> ... <input_plt> <output_archive>\n  pltcompact --config <config.toml> [<input_plt> <output_archive>]\nCommand-line input and output override paths in the config. Specifying no variables implies all will be captured";
+        const USAGE: &str = "usage:\n  amr-compact <variable1> <variable2> ... <input_plt> <output_archive>\n  amr-compact --config <config.toml> [<input_plt> <output_archive>]\nCommand-line input and output override paths in the config. Specifying no variables implies all will be captured";
         let mut args = env::args().skip(1).collect::<Vec<_>>();
 
         if args.iter().any(|arg| arg == "-h" || arg == "--help") {

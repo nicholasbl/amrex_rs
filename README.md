@@ -12,7 +12,7 @@ The crate currently focuses on:
 Inspect a compact archive and report its metadata and value ranges:
 
 ```text
-cargo run --release --bin probe -- archive.compact
+cargo run --release --bin amr-probe -- archive.compact
 ```
 
 ## Basic Usage
@@ -83,14 +83,14 @@ println!(
 The included binary writes an OBJ mesh:
 
 ```sh
-cargo run --bin isosurface -- \
+cargo run --bin amr-isosurface -- \
   /path/to/plt00010 density 1.0 surface.obj
 ```
 
 Up to two additional variables can be sampled onto `mesh.uv` and written as OBJ texture coordinates:
 
 ```sh
-cargo run --bin isosurface -- \
+cargo run --bin amr-isosurface -- \
   /path/to/plt00010 density 1.0 surface.obj \
   --sample temperature 0.0 10.0 \
   --sample pressure 1.0 5.0
@@ -180,7 +180,7 @@ unchanged. Clean repeated-index faces before relaxing the mesh.
 
 ## Compact Archives
 
-The `pltcompact` binary converts an AMReX plotfile directory into a single compact
+The `amr-compact` binary converts an AMReX plotfile directory into a single compact
 archive. This is useful when repeatedly extracting surfaces from the same data: the
 archive stores the selected components in the sparse layout used by the isosurface
 code, so the original FAB files do not need to be read and compacted on every run.
@@ -189,32 +189,32 @@ The command takes zero or more variable names, followed by the input plotfile an
 output archive:
 
 ```text
-pltcompact [<variable> ...] <input_plt> <output_archive>
+amr-compact [<variable> ...] <input_plt> <output_archive>
 ```
 
 Variable names are case-sensitive. To archive only `density` and `temperature`:
 
 ```sh
-cargo run --release --bin pltcompact -- \
+cargo run --release --bin amr-compact -- \
   density temperature /path/to/plt00010 plt00010.compact
 ```
 
 Omit the variable names to include every variable in the plotfile:
 
 ```sh
-cargo run --release --bin pltcompact -- \
+cargo run --release --bin amr-compact -- \
   /path/to/plt00010 plt00010.compact
 ```
 
-On completion, `pltcompact` reports the compact-load, archive-building, and
+On completion, `amr-compact` reports the compact-load, archive-building, and
 serialization timings to standard error in seconds.
 
-The `isosurface` binary accepts the resulting archive anywhere it accepts a
+The `amr-isosurface` binary accepts the resulting archive anywhere it accepts a
 plotfile directory. The surface variable and every `--sample` variable must have
 been included when the archive was created:
 
 ```sh
-cargo run --release --bin isosurface -- \
+cargo run --release --bin amr-isosurface -- \
   plt00010.compact density 1.0 surface.obj \
   --sample temperature 0.0 10.0
 ```
@@ -242,7 +242,7 @@ println!("original variable count = {}", compact.variable_count());
 An empty `component_ids` list selects all variables. Otherwise, component IDs are
 the zero-based indices exposed by `PlotFile::variables()`.
 
-For per-variable storage, pass a reusable TOML configuration to `pltcompact`.
+For per-variable storage, pass a reusable TOML configuration to `amr-compact`.
 `scalar_type` controls the values reconstructed by the reader. Quantities
 default to `f32`; `f64` retains genuine double precision, while `unorm32` maps
 one global physical range to all 32 bits of an unsigned integer:
@@ -282,11 +282,11 @@ Omitting `codec` uses `auto:lossless`.
 
 Chunk codecs have independent numeric ids and versions in the archive. Their
 metadata and payloads are length-delimited, allowing future codecs to be added
-without changing the container format. `probe` reports the codec mix, payload
+without changing the container format. `amr-probe` reports the codec mix, payload
 sizes, and maximum observed error bound without decoding scalar values.
 
 ```sh
-cargo run --release --bin pltcompact -- \
+cargo run --release --bin amr-compact -- \
   --config compact.toml /path/to/plt00010 plt00010.compact
 ```
 
@@ -298,7 +298,7 @@ override the paths from the TOML.
 For convenience, `normalize` without an explicit `scalar_type` implies
 `unorm32`. Global normalization is performed in `f64` as
 `round(clamp((value - min) / (max - min), 0, 1) * u32::MAX)`. The original
-bounds are retained in archive metadata and shown by `probe`. Isovalues for
+bounds are retained in archive metadata and shown by `amr-probe`. Isovalues for
 normalized quantities must likewise be in the normalized `[0, 1]` range.
 Omitting `variables` selects every quantity as `f32`.
 
@@ -313,7 +313,7 @@ rewritten losslessly using the dense codec native to its reconstructed scalar
 type:
 
 ```sh
-cargo run --release --bin compact_transcode -- \
+cargo run --release --bin amr-transcode -- \
   source.compact dense-reference.compact
 ```
 
@@ -332,7 +332,7 @@ error = { absolute = 1.0 }
 ```
 
 ```sh
-cargo run --release --bin compact_transcode -- --config transcode.toml
+cargo run --release --bin amr-transcode -- --config transcode.toml
 ```
 
 Command-line input and output paths may follow the config path to override its
@@ -351,4 +351,4 @@ mesh positions and UVs are stored as `f32` for graphics use.
 
 The compact archive format is intended for use by this crate and may change before a stable 1.0 release.
 The current offset-based format is version 6. Earlier archives must be
-regenerated with the current `pltcompact`.
+regenerated with the current `amr-compact`.

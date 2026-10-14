@@ -128,7 +128,7 @@ impl ConfigErrorTolerance {
 
 impl Args {
     fn parse() -> Result<Self> {
-        const USAGE: &str = "usage:\n  compact_transcode <input_archive> <output_archive>\n  compact_transcode --config <config.toml> [<input_archive> <output_archive>]\nWithout a config, all stored quantities are rewritten losslessly using their native dense scalar codec.";
+        const USAGE: &str = "usage:\n  amr-transcode <input_archive> <output_archive>\n  amr-transcode --config <config.toml> [<input_archive> <output_archive>]\nWithout a config, all stored quantities are rewritten losslessly using their native dense scalar codec.";
         let args = env::args().skip(1).collect::<Vec<_>>();
         if args.iter().any(|arg| arg == "-h" || arg == "--help") {
             println!("{USAGE}");

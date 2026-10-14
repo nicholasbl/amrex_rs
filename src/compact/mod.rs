@@ -1635,7 +1635,7 @@ mod tests {
     #[test]
     fn transcode_preserves_scalar_type_and_reencodes_chunks() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
-            "amrex_rs_compact_transcode_test_{}",
+            "amrex_rs_amr_transcode_test_{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
