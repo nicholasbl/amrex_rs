@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use glam::{DVec3, I64Vec3, IVec3, UVec3};
+use std::time::{Duration, Instant};
 
 use crate::compact::scalar::CompactScalarGrid;
 use crate::compact::{CompactScalarType, NonFinitePolicy};
@@ -14,6 +15,16 @@ pub(crate) struct SparseAmr {
     pub(crate) component_ids: Vec<usize>,
     pub(crate) non_finite_replacements: Vec<usize>,
     pub(crate) levels: Vec<SparseAmrLevel>,
+    pub(crate) timings: SparseAmrLoadTimings,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SparseAmrLoadTimings {
+    pub(crate) fab_read_decode: Duration,
+    pub(crate) scalar_conversion_insert: Duration,
+    pub(crate) patch_count: usize,
+    pub(crate) component_patch_count: usize,
+    pub(crate) sample_count: usize,
 }
 
 pub(crate) struct SparseAmrLevel {
@@ -46,7 +57,7 @@ impl SparseAmr {
         }
 
         let reader = DataReader::new(plot_file);
-        let levels = plot_file
+        let loaded_levels = plot_file
             .levels()
             .map(|level| {
                 load_level(
@@ -60,6 +71,17 @@ impl SparseAmr {
                 .with_context(|| format!("loading sparse AMR level {}", level.index()))
             })
             .collect::<Result<Vec<_>>>()?;
+
+        let mut timings = SparseAmrLoadTimings::default();
+        let mut levels = Vec::with_capacity(loaded_levels.len());
+        for (level, level_timings) in loaded_levels {
+            timings.fab_read_decode += level_timings.fab_read_decode;
+            timings.scalar_conversion_insert += level_timings.scalar_conversion_insert;
+            timings.patch_count += level_timings.patch_count;
+            timings.component_patch_count += level_timings.component_patch_count;
+            timings.sample_count += level_timings.sample_count;
+            levels.push(level);
+        }
 
         let mut non_finite_replacements = vec![0; component_ids.len()];
         for level in &levels {
@@ -75,6 +97,7 @@ impl SparseAmr {
             component_ids: component_ids.to_vec(),
             non_finite_replacements,
             levels,
+            timings,
         })
     }
 }
@@ -86,7 +109,7 @@ fn load_level(
     component_ids: &[usize],
     scalar_types: &[CompactScalarType],
     non_finite_policy: NonFinitePolicy,
-) -> Result<SparseAmrLevel> {
+) -> Result<(SparseAmrLevel, SparseAmrLoadTimings)> {
     let domain = level.index_domain();
     let bounds = index_extent(domain)?;
     let mut components = scalar_types
@@ -95,8 +118,10 @@ fn load_level(
         .collect::<Vec<_>>();
     let mut non_finite_replacements = vec![0; component_ids.len()];
     let mut valid_regions = Vec::with_capacity(level.patch_count());
+    let mut timings = SparseAmrLoadTimings::default();
 
     for patch in level.patches()? {
+        timings.patch_count += 1;
         let patch_box = patch.index_box();
         ensure!(
             patch_box.index_type == domain.index_type,
@@ -110,7 +135,7 @@ fn load_level(
             .zip(&mut components)
             .zip(&mut non_finite_replacements)
         {
-            *replacement_count += load_patch_component(
+            let loaded = load_patch_component(
                 reader,
                 patch,
                 component,
@@ -118,20 +143,35 @@ fn load_level(
                 destination,
                 non_finite_policy,
             )?;
+            *replacement_count += loaded.replacements;
+            timings.fab_read_decode += loaded.fab_read_decode;
+            timings.scalar_conversion_insert += loaded.scalar_conversion_insert;
+            timings.component_patch_count += 1;
+            timings.sample_count += loaded.sample_count;
         }
         valid_regions.push(local_aabb);
     }
 
-    Ok(SparseAmrLevel {
-        level_index: level.index(),
-        index_origin: domain.min,
-        index_type: domain.index_type,
-        physical_origin,
-        cell_size: level.cell_size(),
-        components,
-        non_finite_replacements,
-        valid_regions,
-    })
+    Ok((
+        SparseAmrLevel {
+            level_index: level.index(),
+            index_origin: domain.min,
+            index_type: domain.index_type,
+            physical_origin,
+            cell_size: level.cell_size(),
+            components,
+            non_finite_replacements,
+            valid_regions,
+        },
+        timings,
+    ))
+}
+
+struct PatchComponentLoad {
+    replacements: usize,
+    fab_read_decode: Duration,
+    scalar_conversion_insert: Duration,
+    sample_count: usize,
 }
 
 fn load_patch_component(
@@ -141,8 +181,9 @@ fn load_patch_component(
     local_aabb: Aabb3u,
     destination: &mut CompactScalarGrid,
     non_finite_policy: NonFinitePolicy,
-) -> Result<usize> {
+) -> Result<PatchComponentLoad> {
     let patch_box = patch.index_box();
+    let read_start = Instant::now();
     let view = reader.component(patch, component)?;
     let value_count = local_aabb
         .volume_usize()
@@ -164,10 +205,19 @@ fn load_patch_component(
             }
         }
     }
+    let fab_read_decode = read_start.elapsed();
 
-    destination
+    let conversion_start = Instant::now();
+    let replacements = destination
         .write_physical_values(local_aabb, &values, non_finite_policy)
-        .with_context(|| format!("writing patch component {component}"))
+        .with_context(|| format!("writing patch component {component}"))?;
+    let scalar_conversion_insert = conversion_start.elapsed();
+    Ok(PatchComponentLoad {
+        replacements,
+        fab_read_decode,
+        scalar_conversion_insert,
+        sample_count: value_count,
+    })
 }
 
 fn index_extent(domain: &IndexDomain) -> Result<UVec3> {

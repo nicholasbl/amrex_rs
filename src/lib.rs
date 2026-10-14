@@ -19,9 +19,9 @@ pub use compact::{
     CompactArchiveView, CompactChunkCodec, CompactChunkCodecSelection, CompactChunkCodecStats,
     CompactComponentCodec, CompactComponentErrorTolerance, CompactComponentScalarType,
     CompactComponentStats, CompactErrorTolerance, CompactOptions, CompactPlot, CompactScalarType,
-    NonFinitePolicy, NonFiniteReplacement, TranscodeCompactOptions, TranscodeCompactResult,
-    read_compact, read_compact_selected, transcode_compact, view_compact, view_compact_unchecked,
-    write_compact,
+    CompactStageTimings, CompactWorkCounts, NonFinitePolicy, NonFiniteReplacement,
+    TranscodeCompactOptions, TranscodeCompactResult, WriteCompactResult, read_compact,
+    read_compact_selected, transcode_compact, view_compact, view_compact_unchecked, write_compact,
 };
 pub use decimate::{
     DecimateErrorMode, DecimateOptions, DecimateParallelOptions, DecimatePipelineOptions,

@@ -67,14 +67,62 @@ impl ResolvedComponentCodec {
 /// Result from a compaction operation
 #[derive(Debug, Default)]
 pub struct WriteCompactResult {
+    /// Total time inside [`write_compact`], excluding caller-owned flushing.
+    pub total_time: Duration,
     /// Time spent loading and indexing the sparse AMR hierarchy.
     pub compact_time: Duration,
     /// Time spent building archive blocks and metadata.
     pub archive_time: Duration,
     /// Time spent encoding and writing archive bytes.
     pub serialization_time: Duration,
+    /// Detailed stage timings for locating compaction bottlenecks.
+    pub stages: CompactStageTimings,
+    /// Amount of source and sparse work represented by the timing report.
+    pub work: CompactWorkCounts,
     /// Aggregate non-finite or unrepresentable replacements, omitting zero counts.
     pub non_finite_replacements: Vec<NonFiniteReplacement>,
+}
+
+/// Detailed timings for a plotfile-to-compact conversion.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompactStageTimings {
+    pub fab_read_decode: Duration,
+    pub scalar_conversion_insert: Duration,
+    pub active_cube_build: Duration,
+    pub value_range_build: Duration,
+    pub codec_encode: Duration,
+    pub archive_metadata: Duration,
+    pub rkyv_serialize: Duration,
+    pub file_write: Duration,
+    /// Selection, validation, allocation, and orchestration outside named stages.
+    pub other: Duration,
+}
+
+/// Work counts accompanying [`CompactStageTimings`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CompactWorkCounts {
+    pub level_count: usize,
+    pub component_count: usize,
+    pub patch_count: usize,
+    pub component_patch_count: usize,
+    pub sample_count: usize,
+    pub scalar_chunk_count: usize,
+    pub active_cube_chunk_count: usize,
+    pub value_range_count: usize,
+}
+
+#[derive(Debug, Default)]
+struct CompactLoadReport {
+    timings: CompactStageTimings,
+    work: CompactWorkCounts,
+}
+
+#[derive(Debug, Default)]
+struct ArchiveWriteTimings {
+    codec_encode: Duration,
+    archive_metadata: Duration,
+    rkyv_serialize: Duration,
+    file_write: Duration,
 }
 
 /// Options for rewriting an existing compact archive with new chunk codecs.
@@ -110,7 +158,7 @@ pub fn write_compact(
     let component_ids = selected_component_ids(plot_file, &options)?;
     let scalar_types = selected_scalar_types(&component_ids, &options)?;
     let codec_requests = selected_codecs(&component_ids, &scalar_types, &options.codecs)?;
-    let (compact, replacement_counts) = CompactPlot::load_with_scalar_types(
+    let (compact, replacement_counts, mut load_report) = CompactPlot::load_with_scalar_types(
         plot_file,
         &component_ids,
         &scalar_types,
@@ -119,12 +167,18 @@ pub fn write_compact(
 
     let compact_time = now.elapsed();
     let codecs = resolve_codecs(&compact, &codec_requests)?;
-    let (archive_time, serialization_time) = write_archive(
+    let archive_timings = write_archive(
         ArchiveHeader::from_header(plot_file.header()),
         compact,
         &codecs,
         dest,
     )?;
+    load_report.timings.codec_encode = archive_timings.codec_encode;
+    load_report.timings.archive_metadata = archive_timings.archive_metadata;
+    load_report.timings.rkyv_serialize = archive_timings.rkyv_serialize;
+    load_report.timings.file_write = archive_timings.file_write;
+    let archive_time = archive_timings.codec_encode + archive_timings.archive_metadata;
+    let serialization_time = archive_timings.rkyv_serialize + archive_timings.file_write;
     let non_finite_replacements = component_ids
         .iter()
         .zip(replacement_counts)
@@ -136,10 +190,24 @@ pub fn write_compact(
         })
         .collect();
 
+    let total_time = now.elapsed();
+    let attributed_time = load_report.timings.fab_read_decode
+        + load_report.timings.scalar_conversion_insert
+        + load_report.timings.active_cube_build
+        + load_report.timings.value_range_build
+        + load_report.timings.codec_encode
+        + load_report.timings.archive_metadata
+        + load_report.timings.rkyv_serialize
+        + load_report.timings.file_write;
+    load_report.timings.other = total_time.saturating_sub(attributed_time);
+
     Ok(WriteCompactResult {
+        total_time,
         compact_time,
         archive_time,
         serialization_time,
+        stages: load_report.timings,
+        work: load_report.work,
         non_finite_replacements,
     })
 }
@@ -169,7 +237,9 @@ pub fn transcode_compact(
         &options.codecs,
     )?;
     let codecs = resolve_codecs(&compact, &requests)?;
-    let (archive_time, serialization_time) = write_archive(source_header, compact, &codecs, dest)?;
+    let archive_timings = write_archive(source_header, compact, &codecs, dest)?;
+    let archive_time = archive_timings.codec_encode + archive_timings.archive_metadata;
+    let serialization_time = archive_timings.rkyv_serialize + archive_timings.file_write;
 
     Ok(TranscodeCompactResult {
         decode_time,
@@ -701,7 +771,7 @@ impl CompactPlot {
             &scalar_types,
             NonFinitePolicy::ReplaceWithZero,
         )
-        .map(|(plot, _)| plot)
+        .map(|(plot, _, _)| plot)
     }
 
     fn load_with_scalar_types(
@@ -709,7 +779,7 @@ impl CompactPlot {
         component_ids: &[usize],
         scalar_types: &[CompactScalarType],
         non_finite_policy: NonFinitePolicy,
-    ) -> Result<(Self, Vec<usize>)> {
+    ) -> Result<(Self, Vec<usize>, CompactLoadReport)> {
         let sparse_amr =
             SparseAmr::load(plot_file, component_ids, scalar_types, non_finite_policy)?;
         ensure!(
@@ -718,6 +788,20 @@ impl CompactPlot {
         );
 
         let non_finite_replacements = sparse_amr.non_finite_replacements;
+        let mut report = CompactLoadReport::default();
+        report.timings.fab_read_decode = sparse_amr.timings.fab_read_decode;
+        report.timings.scalar_conversion_insert = sparse_amr.timings.scalar_conversion_insert;
+        report.work.level_count = sparse_amr.levels.len();
+        report.work.component_count = component_ids.len();
+        report.work.patch_count = sparse_amr.timings.patch_count;
+        report.work.component_patch_count = sparse_amr.timings.component_patch_count;
+        report.work.sample_count = sparse_amr.timings.sample_count;
+        report.work.scalar_chunk_count = sparse_amr
+            .levels
+            .iter()
+            .flat_map(|level| &level.components)
+            .map(CompactScalarGrid::chunk_count)
+            .sum();
         let mut levels: Vec<CompactLevel> = Vec::with_capacity(sparse_amr.levels.len());
         for sparse_level in sparse_amr.levels {
             let SparseAmrLevel {
@@ -734,16 +818,22 @@ impl CompactPlot {
                 index_type == IVec3::ZERO,
                 "compact plot extraction requires cell-centered data"
             );
+            let active_start = Instant::now();
             let eligible_cubes = build_active_dual_cubes_for_scalar(
                 components
                     .first()
                     .context("compact plot requires at least one component")?,
                 &valid_regions,
             );
+            report.timings.active_cube_build += active_start.elapsed();
+            report.work.active_cube_chunk_count += eligible_cubes.chunk_count();
+            let range_start = Instant::now();
             let value_ranges = components
                 .iter()
                 .map(|component| build_chunk_value_ranges(component, &eligible_cubes))
-                .collect();
+                .collect::<Vec<_>>();
+            report.timings.value_range_build += range_start.elapsed();
+            report.work.value_range_count += value_ranges.iter().map(Vec::len).sum::<usize>();
             levels.push(CompactLevel {
                 level_index,
                 index_origin,
@@ -773,6 +863,7 @@ impl CompactPlot {
                 levels,
             },
             non_finite_replacements,
+            report,
         ))
     }
 
@@ -852,13 +943,12 @@ fn write_archive(
     compact: CompactPlot,
     codecs: &[ResolvedComponentCodec],
     dest: &mut impl Write,
-) -> Result<(Duration, Duration)> {
-    let mut archive_time = Duration::ZERO;
-    let mut serialization_time = Duration::ZERO;
+) -> Result<ArchiveWriteTimings> {
+    let mut timings = ArchiveWriteTimings::default();
     let write_start = Instant::now();
     dest.write_all(&FORMAT_MAGIC.to_le_bytes())?;
     dest.write_all(&FORMAT_VERSION.to_le_bytes())?;
-    serialization_time += write_start.elapsed();
+    timings.file_write += write_start.elapsed();
     let mut offset = PREFIX_LENGTH;
 
     let CompactPlot {
@@ -887,37 +977,37 @@ fn write_archive(
                 CompactScalarGrid::F32(grid) => {
                     let start = Instant::now();
                     let grid = chunk_codec::encode_f32(grid, codec)?;
-                    archive_time += start.elapsed();
+                    timings.codec_encode += start.elapsed();
                     let start = Instant::now();
                     let bytes = rkyv::to_bytes::<Error>(&grid)
                         .context("serializing f32 compact component")?;
-                    serialization_time += start.elapsed();
+                    timings.rkyv_serialize += start.elapsed();
                     bytes
                 }
                 CompactScalarGrid::F64(grid) => {
                     let start = Instant::now();
                     let grid = chunk_codec::encode_f64(grid, codec)?;
-                    archive_time += start.elapsed();
+                    timings.codec_encode += start.elapsed();
                     let start = Instant::now();
                     let bytes = rkyv::to_bytes::<Error>(&grid)
                         .context("serializing f64 compact component")?;
-                    serialization_time += start.elapsed();
+                    timings.rkyv_serialize += start.elapsed();
                     bytes
                 }
                 CompactScalarGrid::UNorm32 { values, .. } => {
                     let start = Instant::now();
                     let grid = chunk_codec::encode_unorm32(values, codec)?;
-                    archive_time += start.elapsed();
+                    timings.codec_encode += start.elapsed();
                     let start = Instant::now();
                     let bytes = rkyv::to_bytes::<Error>(&grid)
                         .context("serializing UNorm32 compact component")?;
-                    serialization_time += start.elapsed();
+                    timings.rkyv_serialize += start.elapsed();
                     bytes
                 }
             };
             let write_start = Instant::now();
             let data = write_block(dest, &mut offset, &bytes)?;
-            serialization_time += write_start.elapsed();
+            timings.file_write += write_start.elapsed();
             let archive_start = Instant::now();
             component_blocks.push(ArchiveComponentBlock {
                 data,
@@ -932,19 +1022,19 @@ fn write_archive(
                     })
                     .collect(),
             });
-            archive_time += archive_start.elapsed();
+            timings.archive_metadata += archive_start.elapsed();
         }
 
         let start = Instant::now();
         let mask = ArchiveMaskGrid::from_grid(&level.eligible_cubes);
-        archive_time += start.elapsed();
+        timings.archive_metadata += start.elapsed();
         let start = Instant::now();
         let mask_bytes =
             rkyv::to_bytes::<Error>(&mask).context("serializing compact active-cube mask")?;
-        serialization_time += start.elapsed();
+        timings.rkyv_serialize += start.elapsed();
         let write_start = Instant::now();
         let active_cubes = write_block(dest, &mut offset, &mask_bytes)?;
-        serialization_time += write_start.elapsed();
+        timings.file_write += write_start.elapsed();
         let archive_start = Instant::now();
         archive_levels.push(ArchiveLevel {
             level_index: level.level_index as u64,
@@ -954,7 +1044,7 @@ fn write_archive(
             components: component_blocks,
             active_cubes,
         });
-        archive_time += archive_start.elapsed();
+        timings.archive_metadata += archive_start.elapsed();
     }
 
     let archive_start = Instant::now();
@@ -988,10 +1078,10 @@ fn write_archive(
         components,
         levels: archive_levels,
     };
-    archive_time += archive_start.elapsed();
+    timings.archive_metadata += archive_start.elapsed();
     let serialization_start = Instant::now();
     let header_bytes = rkyv::to_bytes::<Error>(&archive).context("serializing compact header")?;
-    serialization_time += serialization_start.elapsed();
+    timings.rkyv_serialize += serialization_start.elapsed();
 
     let write_start = Instant::now();
     align_writer(dest, &mut offset)?;
@@ -1004,9 +1094,9 @@ fn write_archive(
     let _final_length = offset
         .checked_add(FOOTER_LENGTH)
         .context("compact file length overflow")?;
-    serialization_time += write_start.elapsed();
+    timings.file_write += write_start.elapsed();
 
-    Ok((archive_time, serialization_time))
+    Ok(timings)
 }
 
 fn write_block(dest: &mut impl Write, offset: &mut u64, bytes: &[u8]) -> Result<ArchiveBlock> {
@@ -1826,8 +1916,22 @@ mod tests {
         let result = (|| -> Result<()> {
             let plotfile = PlotFile::open(&root)?;
             let mut bytes = Vec::new();
-            write_compact(&plotfile, CompactOptions::default(), &mut bytes)?;
+            let written = write_compact(&plotfile, CompactOptions::default(), &mut bytes)?;
             ensure!(!bytes.is_empty(), "compact archive is empty");
+            ensure!(
+                written.work
+                    == CompactWorkCounts {
+                        level_count: 1,
+                        component_count: 1,
+                        patch_count: 1,
+                        component_patch_count: 1,
+                        sample_count: 8,
+                        scalar_chunk_count: 1,
+                        active_cube_chunk_count: 1,
+                        value_range_count: 1,
+                    },
+                "compact work counts changed"
+            );
             ensure!(
                 bytes[..4] == FORMAT_MAGIC.to_le_bytes()
                     && bytes[4..8] == FORMAT_VERSION.to_le_bytes(),

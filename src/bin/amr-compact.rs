@@ -2,6 +2,7 @@ use std::{
     fs::{self, File},
     io::{BufWriter, Write},
     path::PathBuf,
+    time::Instant,
 };
 
 use amrex_rs::{
@@ -91,15 +92,42 @@ fn main() -> Result<()> {
         &mut writer,
     )
     .with_context(|| format!("writing compact archive {}", args.output.display()))?;
+    let flush_start = Instant::now();
     writer
         .flush()
         .with_context(|| format!("flushing compact archive {}", args.output.display()))?;
+    let flush_time = flush_start.elapsed();
 
     eprintln!(
-        "timings: compact {}, archive {}, serialization {}",
-        timings.compact_time.as_secs_f32(),
-        timings.archive_time.as_secs_f32(),
-        timings.serialization_time.as_secs_f32()
+        "compaction timings: total {:.6}s, compact {:.6}s, archive {:.6}s, serialization {:.6}s, final flush {:.6}s",
+        timings.total_time.as_secs_f64(),
+        timings.compact_time.as_secs_f64(),
+        timings.archive_time.as_secs_f64(),
+        timings.serialization_time.as_secs_f64(),
+        flush_time.as_secs_f64(),
+    );
+    eprintln!(
+        "compaction stage timings: FAB read/decode {:.6}s, scalar conversion/insertion {:.6}s, active-cube build {:.6}s, value-range build {:.6}s, codec encoding {:.6}s, archive metadata {:.6}s, rkyv serialization {:.6}s, buffered writes {:.6}s, other {:.6}s",
+        timings.stages.fab_read_decode.as_secs_f64(),
+        timings.stages.scalar_conversion_insert.as_secs_f64(),
+        timings.stages.active_cube_build.as_secs_f64(),
+        timings.stages.value_range_build.as_secs_f64(),
+        timings.stages.codec_encode.as_secs_f64(),
+        timings.stages.archive_metadata.as_secs_f64(),
+        timings.stages.rkyv_serialize.as_secs_f64(),
+        timings.stages.file_write.as_secs_f64(),
+        timings.stages.other.as_secs_f64(),
+    );
+    eprintln!(
+        "compaction work: levels {}, components {}, patches {}, component-patches {}, scalar samples {}, scalar chunks {}, active-cube chunks {}, value ranges {}",
+        timings.work.level_count,
+        timings.work.component_count,
+        timings.work.patch_count,
+        timings.work.component_patch_count,
+        timings.work.sample_count,
+        timings.work.scalar_chunk_count,
+        timings.work.active_cube_chunk_count,
+        timings.work.value_range_count,
     );
     for replacement in timings.non_finite_replacements {
         let name = plotfile
