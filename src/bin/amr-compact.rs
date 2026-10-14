@@ -1,5 +1,4 @@
 use std::{
-    env,
     fs::{self, File},
     io::{BufWriter, Write},
     path::PathBuf,
@@ -11,10 +10,11 @@ use amrex_rs::{
     NonFinitePolicy, PlotFile, write_compact,
 };
 use anyhow::{Context, Result, bail, ensure};
+use clap::Parser;
 use serde::Deserialize;
 
 fn main() -> Result<()> {
-    let args = Args::parse()?;
+    let args = ResolvedArgs::resolve(Cli::parse())?;
 
     let plotfile = PlotFile::open(&args.input)
         .with_context(|| format!("opening plotfile {}", args.input.display()))?;
@@ -115,7 +115,25 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-struct Args {
+#[derive(Debug, Parser)]
+#[command(
+    about = "Convert an AMReX plotfile into a compact AMR archive",
+    after_help = "With --config, positional paths are optional overrides for paths in the TOML file."
+)]
+struct Cli {
+    /// Reusable TOML compaction configuration.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Quantity to include. Repeat to select multiple quantities; omit for all.
+    #[arg(short, long, value_name = "NAME", action = clap::ArgAction::Append, conflicts_with = "config")]
+    variable: Vec<String>,
+    /// Source AMReX plotfile directory.
+    input: Option<PathBuf>,
+    /// Destination compact archive.
+    output: Option<PathBuf>,
+}
+
+struct ResolvedArgs {
     input: PathBuf,
     output: PathBuf,
     variables: Vec<VariableConfig>,
@@ -201,34 +219,26 @@ fn parse_codec(value: &str) -> Result<CompactChunkCodecSelection> {
     Ok(selection)
 }
 
-impl Args {
-    fn parse() -> Result<Self> {
-        const USAGE: &str = "usage:\n  amr-compact <variable1> <variable2> ... <input_plt> <output_archive>\n  amr-compact --config <config.toml> [<input_plt> <output_archive>]\nCommand-line input and output override paths in the config. Specifying no variables implies all will be captured";
-        let mut args = env::args().skip(1).collect::<Vec<_>>();
-
-        if args.iter().any(|arg| arg == "-h" || arg == "--help") {
-            println!("{USAGE}");
-            std::process::exit(0);
-        }
-
-        if args.first().is_some_and(|arg| arg == "--config") {
-            ensure!(args.len() == 2 || args.len() == 4, "{USAGE}");
-            let path = PathBuf::from(&args[1]);
+impl ResolvedArgs {
+    fn resolve(cli: Cli) -> Result<Self> {
+        if let Some(path) = cli.config {
             let source = fs::read_to_string(&path)
                 .with_context(|| format!("reading config {}", path.display()))?;
             let config: Config = toml::from_str(&source)
                 .with_context(|| format!("parsing config {}", path.display()))?;
-            let (input, output) = if args.len() == 4 {
-                (PathBuf::from(&args[2]), PathBuf::from(&args[3]))
-            } else {
-                (
+            let (input, output) = match (cli.input, cli.output) {
+                (Some(input), Some(output)) => (input, output),
+                (None, None) => (
                     config
                         .input
                         .context("config has no input; provide one on the command line")?,
                     config
                         .output
                         .context("config has no output; provide one on the command line")?,
-                )
+                ),
+                _ => {
+                    bail!("--config path overrides require both INPUT_PLOTFILE and OUTPUT_ARCHIVE")
+                }
             };
             return Ok(Self {
                 input,
@@ -238,18 +248,14 @@ impl Args {
             });
         }
 
-        let Some(output) = args.pop() else {
-            bail!("missing output: {USAGE}");
-        };
-
-        let Some(input) = args.pop() else {
-            bail!("missing input: {USAGE}");
-        };
+        let input = cli.input.context("missing INPUT_PLOTFILE")?;
+        let output = cli.output.context("missing OUTPUT_ARCHIVE")?;
 
         Ok(Self {
-            input: input.into(),
-            output: output.into(),
-            variables: args
+            input,
+            output,
+            variables: cli
+                .variable
                 .into_iter()
                 .map(|name| VariableConfig {
                     name,
@@ -267,6 +273,30 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clap_parses_repeated_variable_options() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "amr-compact",
+            "--variable",
+            "density",
+            "--variable",
+            "temperature",
+            "plt00010",
+            "output.compact",
+        ])?;
+        let args = ResolvedArgs::resolve(cli)?;
+        assert_eq!(args.input, PathBuf::from("plt00010"));
+        assert_eq!(args.output, PathBuf::from("output.compact"));
+        assert_eq!(
+            args.variables
+                .iter()
+                .map(|variable| variable.name.as_str())
+                .collect::<Vec<_>>(),
+            ["density", "temperature"]
+        );
+        Ok(())
+    }
 
     #[test]
     fn parses_toml_variable_normalization() -> Result<()> {

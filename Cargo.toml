@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 glam = "0.33"
 memmap2 = "0.9"
 meshopt = "0.6.2"

@@ -1,5 +1,4 @@
 use std::{
-    env,
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -10,10 +9,11 @@ use amrex_rs::{
     TranscodeCompactOptions, transcode_compact, view_compact,
 };
 use anyhow::{Context, Result, bail, ensure};
+use clap::Parser;
 use serde::Deserialize;
 
 fn main() -> Result<()> {
-    let args = Args::parse()?;
+    let args = ResolvedArgs::resolve(Cli::parse())?;
     reject_same_file(&args.input, &args.output)?;
 
     let input_file = File::open(&args.input)
@@ -77,7 +77,22 @@ fn reject_same_file(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-struct Args {
+#[derive(Debug, Parser)]
+#[command(
+    about = "Rewrite a compact AMR archive with different chunk codecs",
+    after_help = "Without --config, INPUT_ARCHIVE and OUTPUT_ARCHIVE are required and all quantities are rewritten losslessly.\nWith --config, positional paths override paths from the TOML file."
+)]
+struct Cli {
+    /// Reusable TOML transcode configuration.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Source compact archive.
+    input: Option<PathBuf>,
+    /// Destination compact archive.
+    output: Option<PathBuf>,
+}
+
+struct ResolvedArgs {
     input: PathBuf,
     output: PathBuf,
     config: Config,
@@ -126,26 +141,16 @@ impl ConfigErrorTolerance {
     }
 }
 
-impl Args {
-    fn parse() -> Result<Self> {
-        const USAGE: &str = "usage:\n  amr-transcode <input_archive> <output_archive>\n  amr-transcode --config <config.toml> [<input_archive> <output_archive>]\nWithout a config, all stored quantities are rewritten losslessly using their native dense scalar codec.";
-        let args = env::args().skip(1).collect::<Vec<_>>();
-        if args.iter().any(|arg| arg == "-h" || arg == "--help") {
-            println!("{USAGE}");
-            std::process::exit(0);
-        }
-
-        if args.first().is_some_and(|arg| arg == "--config") {
-            ensure!(args.len() == 2 || args.len() == 4, "{USAGE}");
-            let config_path = PathBuf::from(&args[1]);
+impl ResolvedArgs {
+    fn resolve(cli: Cli) -> Result<Self> {
+        if let Some(config_path) = cli.config {
             let source = fs::read_to_string(&config_path)
                 .with_context(|| format!("reading config {}", config_path.display()))?;
             let mut config: Config = toml::from_str(&source)
                 .with_context(|| format!("parsing config {}", config_path.display()))?;
-            let (input, output) = if args.len() == 4 {
-                (PathBuf::from(&args[2]), PathBuf::from(&args[3]))
-            } else {
-                (
+            let (input, output) = match (cli.input, cli.output) {
+                (Some(input), Some(output)) => (input, output),
+                (None, None) => (
                     config
                         .input
                         .take()
@@ -154,7 +159,8 @@ impl Args {
                         .output
                         .take()
                         .context("config has no output; provide one on the command line")?,
-                )
+                ),
+                _ => bail!("--config path overrides require both INPUT_ARCHIVE and OUTPUT_ARCHIVE"),
             };
             return Ok(Self {
                 input,
@@ -163,10 +169,11 @@ impl Args {
             });
         }
 
-        ensure!(args.len() == 2, "{USAGE}");
+        let input = cli.input.context("missing INPUT_ARCHIVE")?;
+        let output = cli.output.context("missing OUTPUT_ARCHIVE")?;
         Ok(Self {
-            input: PathBuf::from(&args[0]),
-            output: PathBuf::from(&args[1]),
+            input,
+            output,
             config: Config::default(),
         })
     }
@@ -256,6 +263,15 @@ fn parse_codec(value: &str) -> Result<CompactChunkCodecSelection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clap_parses_direct_transcode_paths() -> Result<()> {
+        let cli = Cli::try_parse_from(["amr-transcode", "source.compact", "output.compact"])?;
+        let args = ResolvedArgs::resolve(cli)?;
+        assert_eq!(args.input, PathBuf::from("source.compact"));
+        assert_eq!(args.output, PathBuf::from("output.compact"));
+        Ok(())
+    }
 
     #[test]
     fn parses_transcode_config() -> Result<()> {

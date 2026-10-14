@@ -185,21 +185,22 @@ archive. This is useful when repeatedly extracting surfaces from the same data: 
 archive stores the selected components in the sparse layout used by the isosurface
 code, so the original FAB files do not need to be read and compacted on every run.
 
-The command takes zero or more variable names, followed by the input plotfile and
-output archive:
+The command takes the input plotfile and output archive. Repeat `--variable` to
+select quantities explicitly:
 
 ```text
-amr-compact [<variable> ...] <input_plt> <output_archive>
+amr-compact [--variable <name>]... <input_plt> <output_archive>
 ```
 
 Variable names are case-sensitive. To archive only `density` and `temperature`:
 
 ```sh
 cargo run --release --bin amr-compact -- \
-  density temperature /path/to/plt00010 plt00010.compact
+  --variable density --variable temperature \
+  /path/to/plt00010 plt00010.compact
 ```
 
-Omit the variable names to include every variable in the plotfile:
+Omit `--variable` to include every variable in the plotfile:
 
 ```sh
 cargo run --release --bin amr-compact -- \

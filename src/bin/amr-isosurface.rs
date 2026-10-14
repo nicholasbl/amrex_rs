@@ -1,8 +1,6 @@
 use std::{
-    env,
     fs::File,
     io::{BufWriter, Write},
-    ops::RangeInclusive,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -11,82 +9,30 @@ use amrex_rs::{
     CompactPlot, IsosurfaceOptions, Mesh3D, PlotFile, Sample, Surface, Variable,
     isosurface::IsosurfaceTimings, isosurface_compact, read_compact,
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
+use clap::Parser;
 
+#[derive(Debug, Parser)]
+#[command(about = "Extract an MC33 isosurface from an AMReX plotfile or compact archive")]
 struct Args {
+    /// AMReX plotfile directory or compact archive.
     input: PathBuf,
+    /// Quantity from which to extract the surface.
     variable: String,
+    /// Scalar isovalue of the requested surface.
+    #[arg(allow_hyphen_values = true)]
     isovalue: f64,
+    /// Destination Wavefront OBJ file.
     output: PathBuf,
-    samples: Vec<(String, RangeInclusive<f64>)>,
-}
-
-fn usage(program: &str) -> String {
-    format!(
-        "Usage: {program} <input> <variable> <isovalue> <output.obj> [options]\n\
-         \n\
-         <input> may be an AMReX plotfile directory or a compact archive.\n\
-         \n\
-         Options:\n\
-           --sample <variable> <min> <max>  Map a quantity to U or V (repeat at most twice)\n\
-           -h, --help                       Show this help"
-    )
-}
-
-fn parse_args() -> Result<Option<Args>> {
-    let mut values = env::args();
-    let program = values
-        .next()
-        .unwrap_or_else(|| "amr-isosurface".to_string());
-    let values = values.collect::<Vec<_>>();
-
-    if values
-        .iter()
-        .any(|value| value == "-h" || value == "--help")
-    {
-        println!("{}", usage(&program));
-        return Ok(None);
-    }
-    ensure!(values.len() >= 4, "{}", usage(&program));
-
-    let input = PathBuf::from(&values[0]);
-    let variable = values[1].clone();
-    let isovalue = values[2]
-        .parse::<f64>()
-        .with_context(|| format!("invalid isovalue {:?}", values[2]))?;
-    let output = PathBuf::from(&values[3]);
-    let mut samples = Vec::new();
-    let mut index = 4;
-
-    while index < values.len() {
-        match values[index].as_str() {
-            "--sample" => {
-                ensure!(
-                    index + 3 < values.len(),
-                    "--sample requires VARIABLE MIN MAX"
-                );
-                ensure!(samples.len() < 2, "--sample may be specified at most twice");
-                let name = values[index + 1].clone();
-                let min = values[index + 2]
-                    .parse::<f64>()
-                    .with_context(|| format!("invalid sample minimum {:?}", values[index + 2]))?;
-                let max = values[index + 3]
-                    .parse::<f64>()
-                    .with_context(|| format!("invalid sample maximum {:?}", values[index + 3]))?;
-                samples.push((name, min..=max));
-                index += 4;
-            }
-            option => bail!("unknown option {option:?}\n{}", usage(&program)),
-        }
-    }
-
-    Ok(Some(Args {
-        input,
-        variable,
-        isovalue,
-        output,
-        samples,
-    }))
+    /// Map a quantity into a mesh UV channel. May be repeated twice.
+    #[arg(
+        long = "sample",
+        value_names = ["VARIABLE", "MIN", "MAX"],
+        num_args = 3,
+        action = clap::ArgAction::Append,
+        allow_hyphen_values = true
+    )]
+    sample_values: Vec<String>,
 }
 
 fn component_id(variables: &[Variable], name: &str) -> Result<u32> {
@@ -99,13 +45,24 @@ fn component_id(variables: &[Variable], name: &str) -> Result<u32> {
 
 fn isosurface_options(variables: &[Variable], args: &Args) -> Result<IsosurfaceOptions> {
     let surface_id = component_id(variables, &args.variable)?;
+    ensure!(
+        args.sample_values.len() <= 6,
+        "--sample may be specified at most twice"
+    );
     let sampled_quantities = args
-        .samples
-        .iter()
-        .map(|(name, range)| {
+        .sample_values
+        .chunks_exact(3)
+        .map(|values| {
+            let name = &values[0];
+            let min = values[1]
+                .parse::<f64>()
+                .with_context(|| format!("invalid sample minimum {:?}", values[1]))?;
+            let max = values[2]
+                .parse::<f64>()
+                .with_context(|| format!("invalid sample maximum {:?}", values[2]))?;
             Ok(Sample {
                 id: component_id(variables, name)?,
-                range: range.clone(),
+                range: min..=max,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -200,11 +157,9 @@ fn write_obj(path: &Path, mesh: &Mesh3D, write_uvs: bool) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let Some(args) = parse_args()? else {
-        return Ok(());
-    };
+    let args = Args::parse();
     let (mesh, timings) = extract_isosurface(&args)?;
-    write_obj(&args.output, &mesh, !args.samples.is_empty())?;
+    write_obj(&args.output, &mesh, !args.sample_values.is_empty())?;
     eprintln!(
         "wrote {} vertices and {} faces to {}",
         mesh.positions.len(),
@@ -238,7 +193,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{env, fs};
 
     use super::*;
 
@@ -257,5 +212,27 @@ mod tests {
         assert!(text.contains("v 1 0 0\n"));
         assert!(text.contains("vt 1 0\n"));
         assert!(text.contains("f 1/1 2/2 3/3\n"));
+    }
+
+    #[test]
+    fn clap_parses_repeated_samples_and_negative_ranges() {
+        let args = Args::try_parse_from([
+            "amr-isosurface",
+            "input.compact",
+            "density",
+            "-1.5",
+            "surface.obj",
+            "--sample",
+            "vx",
+            "-10",
+            "10",
+            "--sample",
+            "temperature",
+            "0",
+            "100",
+        ])
+        .unwrap();
+        assert_eq!(args.isovalue, -1.5);
+        assert_eq!(args.sample_values.len(), 6);
     }
 }

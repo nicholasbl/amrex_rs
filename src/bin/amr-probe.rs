@@ -1,29 +1,16 @@
-use std::{env, fs::File, path::PathBuf};
+use std::{fs::File, path::PathBuf};
 
 use amrex_rs::{
     CompactComponentStats, CompactErrorTolerance, CompactScalarType, read_compact, view_compact,
 };
 use anyhow::{Context, Result, ensure};
+use clap::Parser;
 
-fn usage(program: &str) -> String {
-    format!("Usage: {program} <compact-archive>")
-}
-
-fn parse_args() -> Result<Option<PathBuf>> {
-    let mut args = env::args();
-    let program = args.next().unwrap_or_else(|| "amr-probe".to_string());
-    let values = args.collect::<Vec<_>>();
-
-    if values
-        .iter()
-        .any(|value| value == "-h" || value == "--help")
-    {
-        println!("{}", usage(&program));
-        return Ok(None);
-    }
-
-    ensure!(values.len() == 1, "{}", usage(&program));
-    Ok(Some(PathBuf::from(&values[0])))
+#[derive(Debug, Parser)]
+#[command(about = "Inspect a compact AMR archive")]
+struct Args {
+    /// Compact archive to inspect.
+    archive: PathBuf,
 }
 
 fn format_vec3<T: std::fmt::Display>(value: [T; 3]) -> String {
@@ -89,9 +76,7 @@ fn dense_scalar_payload_size(
 }
 
 fn main() -> Result<()> {
-    let Some(path) = parse_args()? else {
-        return Ok(());
-    };
+    let path = Args::parse().archive;
 
     let file =
         File::open(&path).with_context(|| format!("opening compact archive {}", path.display()))?;
