@@ -266,12 +266,30 @@ error = { absolute = 1.0e-4 }
 `codec` controls the on-disk representation independently of `scalar_type`.
 Every codec name uses `family:value` syntax. Automatic policies are
 `auto:lossless` and `auto:smallest`. The latter selects the smallest supported
-codec that meets the configured error tolerance. Concrete codecs force every non-uniform chunk
-to use that codec: `dense:f32`, `dense:f64`, `dense:u32`, `uniform:f64`,
+codec that meets the configured error tolerance. Concrete codecs force every
+non-uniform chunk to use that codec: `dense:f32`, `dense:f64`, `dense:u32`, `uniform:f64`,
 `quantized:u8`, `quantized:u16`, `quantized:u32`, `affine:f64`, and
 `affine-residual:u8`, `affine-residual:u16`, or `affine-residual:u32`.
 Structurally uniform sparse chunks always retain the exact `uniform:f64`
 representation.
+
+The codec families operate independently on each sparse chunk:
+
+| Family | Representation | Typical use |
+| --- | --- | --- |
+| `dense` | Stores every chunk sample directly as `f32`, `f64`, or `u32`. The codec matching the selected `scalar_type` is lossless; converting a non-`f32` scalar representation to `dense:f32` is lossy and must satisfy the error tolerance. | Irregular chunks that cannot be represented more compactly, and lossless reference archives. |
+| `uniform` | Stores one `f64` value for the entire present portion of a chunk; the sparse presence mask remains separate. Truly uniform chunks are represented exactly. A non-uniform chunk may also use its midpoint as an approximation when the error tolerance permits it. | Constant or nearly constant regions. |
+| `quantized` | Finds a chunk-local minimum and step size, then stores each sample as an unsigned 8-, 16-, or 32-bit code. Values are reconstructed as `minimum + code * step`. This is local to each chunk, not the global `unorm32` normalization selected by `scalar_type`. | Irregular values with a bounded local range; fewer bits give smaller output but larger error. |
+| `affine` | Fits the four coefficients of a three-dimensional plane, `c0 + c1*x + c2*y + c3*z`, using chunk-local voxel coordinates. Only those coefficients are stored; no per-sample residuals are retained. | Smooth chunks that are almost a constant 3D gradient. |
+| `affine-residual` | Fits the same affine plane, subtracts it from every sample, and quantizes the remaining residuals as 8-, 16-, or 32-bit codes. Decoding adds the quantized residual back to the plane. | Smooth gradients with local structure that a plane alone cannot capture. |
+
+`auto:lossless` chooses exact uniform storage where possible and otherwise uses
+the dense codec native to `scalar_type`. `auto:smallest` tries the applicable
+dense, uniform, quantized, affine, and affine-residual representations and
+selects the smallest candidate that satisfies the pointwise error rule.
+The suffix names the stored representation: for example, `quantized:u16` uses
+16-bit codes, while `affine:f64` stores only double-precision plane
+coefficients. It does not change the quantity's configured `scalar_type`.
 
 Lossy policies require an `error` table; exact native dense codecs and
 `auto:lossless` reject it. `absolute` is expressed in the quantity's original
