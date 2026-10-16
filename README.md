@@ -1,23 +1,21 @@
 # amrex_rs
 
-Rust utilities for reading AMReX plotfiles and extracting MC33 isosurfaces from cell-centered data.
+`amrex_rs` reads AMReX plotfiles and converts one plotfile timestep into the
+source-independent `multires_rs::MsgDataset` model. MSG archive I/O,
+isosurfacing, slicing, relaxation, and decimation live in the sibling
+`multires_rs` crate.
 
-The crate currently focuses on:
+The crate provides:
 
-- parsing AMReX plotfile `Header` and per-level `Cell_H` metadata
-- memory-mapped reads of FAB component data
-- compact sparse AMR archives for selected components
-- MC33 isosurface extraction with optional sampled vertex quantities
+- parsing of AMReX `Header` and per-level `Cell_H` metadata;
+- memory-mapped FAB component access;
+- conversion of selected AMReX components into point-associated MSG fields;
+- the `amrex-to-msg` command-line converter.
 
-Inspect a compact archive and report its metadata and value ranges:
+AMReX cell-center samples are preserved without interpolation and represented
+as points using the MSG dataset's half-cell sample offset.
 
-```text
-cargo run --release --bin amr-probe -- archive.compact
-```
-
-## Basic Usage
-
-Open a plotfile and inspect its metadata:
+## Reading plotfiles
 
 ```rust
 use amrex_rs::PlotFile;
@@ -28,347 +26,64 @@ println!("time = {}", plotfile.header().simulation_time);
 for variable in plotfile.variables() {
     println!("{}: {}", variable.index, variable.name);
 }
-```
 
-Read component data patch by patch:
-
-```rust
-use amrex_rs::PlotFile;
-
-let plotfile = PlotFile::open("plt00010")?;
 let density = plotfile.variable("density").unwrap();
 let reader = plotfile.data_reader();
-
 for level in plotfile.levels() {
     for patch in level.patches()? {
         let values = reader.variable(patch, density)?;
-        println!(
-            "level {} patch {} has {} values",
-            patch.level_index(),
-            patch.index(),
-            values.len()
-        );
+        println!("level {} patch {}: {} values", level.index(), patch.index(), values.len());
     }
 }
+# Ok::<(), anyhow::Error>(())
 ```
 
-Extract an isosurface:
+## Converting to MSG
 
 ```rust
-use amrex_rs::{IsosurfaceOptions, PlotFile, Surface, isosurface};
+use amrex_rs::{AmrexToMsgOptions, PlotFile, plotfile_to_msg};
+use multires_rs::{MsgWriteOptions, write_msg};
 
 let plotfile = PlotFile::open("plt00010")?;
-let density = plotfile.variable("density").unwrap();
-let (mesh, _) = isosurface(
-    &plotfile,
-    IsosurfaceOptions {
-        surface: Surface {
-            id: density.index as u32,
-            value: 1.0,
-        },
-        sampled_quantities: Vec::new(),
-        levels: None,
-        flip_winding: false,
-    },
-)?;
-println!(
-    "{} vertices, {} triangles",
-    mesh.positions.len(),
-    mesh.indices.len()
-);
-```
+let (dataset, report) = plotfile_to_msg(&plotfile, &AmrexToMsgOptions::default())?;
 
-## OBJ Example
-
-The included binary writes an OBJ mesh:
-
-```sh
-cargo run --bin amr-isosurface -- \
-  /path/to/plt00010 density 1.0 surface.obj
-```
-
-Up to two additional variables can be sampled onto `mesh.uv` and written as OBJ texture coordinates:
-
-```sh
-cargo run --bin amr-isosurface -- \
-  /path/to/plt00010 density 1.0 surface.obj \
-  --sample temperature 0.0 10.0 \
-  --sample pressure 1.0 5.0
-```
-
-## Mesh Decimation
-
-Clean up and decimate an extracted mesh with the meshoptimizer-backed convenience pipeline:
-
-```rust
-use amrex_rs::{
-    DecimateOptions, DecimatePipelineOptions, DecimateTarget, decimate_mesh_pipeline,
-};
-
-let result = decimate_mesh_pipeline(
-    &mut mesh,
-    DecimatePipelineOptions {
-        decimate: DecimateOptions {
-            target: DecimateTarget::FaceRatio(0.25),
-            max_error: 0.01,
-            ..DecimateOptions::default()
-        },
-        ..DecimatePipelineOptions::default()
-    },
-)?;
-
-println!(
-    "{} -> {} faces",
-    result.decimation.original_face_count,
-    result.decimation.final_face_count
-);
-println!(
-    "degenerates {:?}, pre-compact {:?}, decimate {:?}, total {:?}",
-    result.timings.degenerate_removal,
-    result.timings.pre_decimation_compaction,
-    result.timings.decimation,
-    result.timings.total,
-);
-println!(
-    "meshoptimizer {:?}, groups {} ({} faces before final), validation {:?} + {:?}, post-compact {:?}",
-    result.decimation.timings.simplification,
-    result.decimation.group_count,
-    result.decimation.intermediate_face_count,
-    result.decimation.timings.input_validation,
-    result.decimation.timings.output_validation,
-    result.decimation.timings.compaction,
-);
-```
-
-MC33 vertices shared by parallel extraction chunks are welded exactly from
-their grid edge/cell keys while each level is merged. The decimation pipeline
-therefore starts with degenerate-face removal and vertex compaction; it does not
-perform approximate geometric welding. Use `decimate_mesh` directly when the
-mesh is already clean. Error limits can be relative to mesh extent or absolute
-in the physical units used by `Mesh3D::positions`.
-
-Large meshes use a topology-aware parallel path by default. Meshlets seed
-larger connected partitions; Rayon simplifies those partitions with locked
-borders, then a final sparse global pass removes the temporary partition
-boundaries. Configure the threshold and group sizes through
-`DecimateParallelOptions`, or set `DecimateOptions::parallel` to `None` to force
-the original serial path. Detailed timings are available in `DecimateTimings`
-for meshlet construction, partitioning, grouped simplification, merging, and
-the final global simplification.
-
-## Vertex Relaxation
-
-Apply optional Taubin smoothing directly to any cleaned `Mesh3D`:
-
-```rust
-use amrex_rs::{VertexRelaxOptions, relax_mesh_vertices};
-
-let result = relax_mesh_vertices(&mut mesh, VertexRelaxOptions::default())?;
-println!(
-    "relaxed {} vertices ({} locked) in {:?}",
-    result.relaxed_vertex_count,
-    result.locked_vertex_count,
-    result.timings.total,
-);
-```
-
-Relaxation is deliberately separate from isosurface extraction and decimation,
-so callers can choose when to apply it. The default performs three
-shrinkage-resistant Taubin pass pairs, clamps each step relative to local edge
-length, locks open and non-manifold boundaries, and leaves UV/scientific values
-unchanged. Clean repeated-index faces before relaxing the mesh.
-
-## Compact Archives
-
-The `amr-compact` binary converts an AMReX plotfile directory into a single compact
-archive. This is useful when repeatedly extracting surfaces from the same data: the
-archive stores the selected components in the sparse layout used by the isosurface
-code, so the original FAB files do not need to be read and compacted on every run.
-
-The command takes the input plotfile and output archive. Repeat `--variable` to
-select quantities explicitly:
-
-```text
-amr-compact [--variable <name>]... <input_plt> <output_archive>
-```
-
-Variable names are case-sensitive. To archive only `density` and `temperature`:
-
-```sh
-cargo run --release --bin amr-compact -- \
-  --variable density --variable temperature \
-  /path/to/plt00010 plt00010.compact
-```
-
-Omit `--variable` to include every variable in the plotfile:
-
-```sh
-cargo run --release --bin amr-compact -- \
-  /path/to/plt00010 plt00010.compact
-```
-
-On completion, `amr-compact` reports the compact-load, archive-building, and
-serialization timings to standard error in seconds.
-
-The `amr-isosurface` binary accepts the resulting archive anywhere it accepts a
-plotfile directory. The surface variable and every `--sample` variable must have
-been included when the archive was created:
-
-```sh
-cargo run --release --bin amr-isosurface -- \
-  plt00010.compact density 1.0 surface.obj \
-  --sample temperature 0.0 10.0
-```
-
-The same functionality is available through the library API:
-
-```rust
-use amrex_rs::{CompactOptions, PlotFile, read_compact, write_compact};
-
-let plotfile = PlotFile::open("plt00010")?;
 let mut bytes = Vec::new();
-write_compact(
-    &plotfile,
-    CompactOptions {
-        component_ids: vec![0],
-        ..CompactOptions::default()
-    },
-    &mut bytes,
-)?;
-
-let compact = read_compact(&bytes)?;
-println!("original variable count = {}", compact.variable_count());
+write_msg(&dataset, &MsgWriteOptions::default(), &mut bytes)?;
+println!("converted {} scalar samples", report.sample_count);
+# Ok::<(), anyhow::Error>(())
 ```
 
-An empty `component_ids` list selects all variables. Otherwise, component IDs are
-the zero-based indices exposed by `PlotFile::variables()`.
+The CLI accepts input/output paths directly:
 
-For per-variable storage, pass a reusable TOML configuration to `amr-compact`.
-`scalar_type` controls the values reconstructed by the reader. Quantities
-default to `f32`; `f64` retains genuine double precision, while `unorm32` maps
-one global physical range to all 32 bits of an unsigned integer:
+```sh
+cargo run --release --bin amrex-to-msg -- plt00010 plt00010.msg
+```
+
+Repeat `--variable NAME` to select fields, or provide a reusable TOML file. When
+`--config` is used, input and output may still be supplied on the command line
+as a pair of overrides.
 
 ```toml
+input = "plt00010"
+output = "plt00010.msg"
+replace_invalid = false
+
 [[variables]]
 name = "density"
-scalar_type = "unorm32"
+scalar_type = "f64"
 codec = "auto:smallest"
-normalize = [1.0e20, 1.000000001e20]
-error = { absolute = 1.0e10, relative_percent = 0.01 }
+error = { absolute = 0.0, relative_percent = 0.01 }
 
 [[variables]]
 name = "temperature"
-scalar_type = "f64"
-codec = "quantized:u16"
-error = { absolute = 1.0e-4 }
+scalar_type = "f32"
+codec = "auto:lossless"
 ```
 
-`codec` controls the on-disk representation independently of `scalar_type`.
-Every codec name uses `family:value` syntax. Automatic policies are
-`auto:lossless` and `auto:smallest`. The latter selects the smallest supported
-codec that meets the configured error tolerance. Concrete codecs force every
-non-uniform chunk to use that codec: `dense:f32`, `dense:f64`, `dense:u32`, `uniform:f64`,
-`quantized:u8`, `quantized:u16`, `quantized:u32`, `affine:f64`, and
-`affine-residual:u8`, `affine-residual:u16`, or `affine-residual:u32`.
-Structurally uniform sparse chunks always retain the exact `uniform:f64`
-representation.
+MSG fields expose physical `f32` or `f64` values. Quantization and affine
+encoding are archive codecs, not logical scalar types. Source values must be
+finite; `replace_invalid = true` explicitly converts invalid or
+unrepresentable source values to zero and reports their counts.
 
-The codec families operate independently on each sparse chunk:
-
-| Family | Representation | Typical use |
-| --- | --- | --- |
-| `dense` | Stores every chunk sample directly as `f32`, `f64`, or `u32`. The codec matching the selected `scalar_type` is lossless; converting a non-`f32` scalar representation to `dense:f32` is lossy and must satisfy the error tolerance. | Irregular chunks that cannot be represented more compactly, and lossless reference archives. |
-| `uniform` | Stores one `f64` value for the entire present portion of a chunk; the sparse presence mask remains separate. Truly uniform chunks are represented exactly. A non-uniform chunk may also use its midpoint as an approximation when the error tolerance permits it. | Constant or nearly constant regions. |
-| `quantized` | Finds a chunk-local minimum and step size, then stores each sample as an unsigned 8-, 16-, or 32-bit code. Values are reconstructed as `minimum + code * step`. This is local to each chunk, not the global `unorm32` normalization selected by `scalar_type`. | Irregular values with a bounded local range; fewer bits give smaller output but larger error. |
-| `affine` | Fits the four coefficients of a three-dimensional plane, `c0 + c1*x + c2*y + c3*z`, using chunk-local voxel coordinates. Only those coefficients are stored; no per-sample residuals are retained. | Smooth chunks that are almost a constant 3D gradient. |
-| `affine-residual` | Fits the same affine plane, subtracts it from every sample, and quantizes the remaining residuals as 8-, 16-, or 32-bit codes. Decoding adds the quantized residual back to the plane. | Smooth gradients with local structure that a plane alone cannot capture. |
-
-`auto:lossless` chooses exact uniform storage where possible and otherwise uses
-the dense codec native to `scalar_type`. `auto:smallest` tries the applicable
-dense, uniform, quantized, affine, and affine-residual representations and
-selects the smallest candidate that satisfies the pointwise error rule.
-The suffix names the stored representation: for example, `quantized:u16` uses
-16-bit codes, while `affine:f64` stores only double-precision plane
-coefficients. It does not change the quantity's configured `scalar_type`.
-
-Lossy policies require an `error` table; exact native dense codecs and
-`auto:lossless` reject it. `absolute` is expressed in the quantity's original
-physical units, including for `unorm32`. `relative_percent` is evaluated against
-each individual source value. A reconstructed value must satisfy
-`abs(decoded - source) <= absolute + relative_percent / 100 * abs(source)`.
-Either field may be omitted and is then zero, but at least one must be present.
-For example, `relative_percent = 0.01` means 0.01%, not 1%. Omitting `codec`
-uses `auto:lossless`.
-
-Chunk codecs have independent numeric ids and versions in the archive. Their
-metadata and payloads are length-delimited, allowing future codecs to be added
-without changing the container format. `amr-probe` reports the codec mix, payload
-sizes, and maximum observed error bound without decoding scalar values.
-
-```sh
-cargo run --release --bin amr-compact -- \
-  --config compact.toml /path/to/plt00010 plt00010.compact
-```
-
-This lets the same variable recipe be reused across a collection of plotfiles.
-`input` and `output` may still be placed in the TOML and the shorter
-`--config compact.toml` form used. When command-line paths are supplied, they
-override the paths from the TOML.
-
-For convenience, `normalize` without an explicit `scalar_type` implies
-`unorm32`. Global normalization is performed in `f64` as
-`round(clamp((value - min) / (max - min), 0, 1) * u32::MAX)`. The original
-bounds are retained in archive metadata and shown by `amr-probe`. Isovalues for
-normalized quantities must likewise be in the normalized `[0, 1]` range.
-Omitting `variables` selects every quantity as `f32`.
-
-By default, compaction replaces non-finite or non-representable values with
-zero and prints aggregate warnings. Set `assume_finite = true` at the top level
-of a trusted config to skip those checks. Input and output may be supplied in
-the config or overridden on the command line.
-
-To compare codec choices without rereading the original plotfile, transcode an
-existing compact archive. With no configuration, every stored quantity is
-rewritten losslessly using the dense codec native to its reconstructed scalar
-type:
-
-```sh
-cargo run --release --bin amr-transcode -- \
-  source.compact dense-reference.compact
-```
-
-Lossy policies can be applied globally with per-variable overrides:
-
-```toml
-input = "dense-reference.compact"
-output = "test-0.01-percent.compact"
-codec = "auto:smallest"
-error = { absolute = 1.0e10, relative_percent = 0.01 }
-
-[[variables]]
-name = "velocity_x"
-codec = "quantized:u16"
-error = { absolute = 1.0 }
-```
-
-```sh
-cargo run --release --bin amr-transcode -- --config transcode.toml
-```
-
-Command-line input and output paths may follow the config path to override its
-paths. Transcoding preserves each quantity's reconstructed scalar type and all
-AMR metadata. It operates on decoded values, so transcoding a lossy archive
-cannot recover precision already discarded; use a lossless dense archive as
-the source when comparing codecs.
-
-## Notes
-
-Isosurface extraction expects cell-centered data. Compact archives contain a
-conservative min/max range for each sparse work chunk, including the positive
-sample halo. Chunks that cannot contain the requested isovalue are rejected
-before MC33 visits individual cubes. Scalar calculations remain in `f64`; final
-mesh positions and UVs are stored as `f32` for graphics use.
-
-The compact archive format is intended for use by this crate and may change before a stable 1.0 release.
-The current offset-based format is version 7. Earlier archives must be
-regenerated with the current `amr-compact`.
+See `../multires_rs/README.md` for the `.msg` layout, codec families, and the
+`msg-probe`, `msg-transcode`, and `msg-isosurface` tools.
