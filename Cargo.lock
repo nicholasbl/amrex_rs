@@ -7,12 +7,9 @@ name = "amrex_rs"
 version = "0.5.0"
 dependencies = [
  "anyhow",
- "clap",
  "glam",
  "memmap2",
  "multires_rs",
- "serde",
- "toml",
 ]
 
 [[package]]

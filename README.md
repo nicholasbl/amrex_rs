@@ -1,5 +1,10 @@
 # amrex_rs
 
+> **Temporarily deprecated:** new AMReX-to-MSG work lives in the library-only
+> `msg_amrex` crate, and command-line conversion lives in `msg_convert`.
+> `amrex_rs` is being retained because the name may be reused for a broader AMR
+> implementation in the future.
+
 `amrex_rs` reads AMReX plotfiles and converts one plotfile timestep into the
 source-independent `multires_rs::MsgDataset` model. MSG archive I/O,
 isosurfacing, slicing, relaxation, and decimation live in the sibling
@@ -10,7 +15,6 @@ The crate provides:
 - parsing of AMReX `Header` and per-level `Cell_H` metadata;
 - memory-mapped FAB component access;
 - conversion of selected AMReX components into point-associated MSG fields;
-- the `amrex-to-msg` command-line converter.
 
 AMReX cell-center samples are preserved without interpolation and represented
 as points using the MSG dataset's half-cell sample offset.
@@ -53,15 +57,8 @@ println!("converted {} scalar samples", report.sample_count);
 # Ok::<(), anyhow::Error>(())
 ```
 
-The CLI accepts input/output paths directly:
-
-```sh
-cargo run --release --bin amrex-to-msg -- plt00010 plt00010.msg
-```
-
-Repeat `--variable NAME` to select fields, or provide a reusable TOML file. When
-`--config` is used, input and output may still be supplied on the command line
-as a pair of overrides.
+The replacement `msg-convert` command accepts input/output paths directly and
+also supports reusable TOML configuration.
 
 ```toml
 input = "plt00010"
